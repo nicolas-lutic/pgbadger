@@ -51,6 +51,7 @@ use FileHandle;
 use Socket;
 use constant EBCDIC => "\t" ne "\011";
 use Encode qw(encode decode);
+use open ':encoding(UTF-8)';
 
 $VERSION = '12.0';
 
@@ -664,7 +665,7 @@ if ($#ARGV >= 0)
 		foreach my $file (@ARGV) {
 			push(@log_files, &set_file_list($file));
 		}
-	} elsif (!$outdir) { 
+	} elsif (!$outdir) {
 		$outdir = $ARGV[0];
 	}
 }
@@ -4923,51 +4924,51 @@ sub detect_new_log_line
 # How does pgBadger detect that a log file need not to be parsed?
 #
 # In process_file():
-# 
+#
 # File LAST_PARSED is not present in the incremental output directory
 #         => the log is fully parsed.
-# 
-# 
+#
+#
 # File LAST_PARSED is present, read the size of the last parsed log and the timestamp from
 # this file then for each log file provided
-# 
+#
 # If the total size of the log (uncompressed) is smaller than the history size
 # or we can not determine the real file size of a compressed file (ex: bzip2)
 #         => read the log from start and exclude all lines older than the history timestamp
-# 
+#
 # If logfile is input from stdin, in binary or csv format, it is download through an http request
 #         => read the log from start and exclude all lines older than the history timestamp
-# 
+#
 # Call check_file_changed(), return code:
 #	- -1 : the file must be parsed from the beginning
 # 	-  0 : the log has already be parsed
 # 	-  1 : the log must be parsed from the history offset
-# 
+#
 #   - If this is a remote log downloaded using http[s] or [s]ftp, we can not move/seek to the historical position/offset
 #         => return -1, read the log from start and exclude all lines older than the history timestamp
-# 
+#
 #   - If this is a compressed remote log we can not move/seek to the historical position/offset
 #         => return -1, read the log from start and exclude all lines older than the history timestamp
 #            Use of zhead and ztail can cost too much in remote mode, just return -1
-# 
+#
 #   - If the log file is compressed we can not seek to history position, the entire file must be read
 #         => return -1, this file must be parsed from start excluding all lines older than the history timestamp
-# 
+#
 #   - If the history size is smaller than the total size fo the log file:
 #         => move/seek to the history size/offset and look at the next line timestamp
 #            though method detect_new_log_line().
 #   - If the history size is equal to the total size fo the log file:
 #         => rewind/seek to history size/offset - 8192
-# 
+#
 #   - Then go through method detect_new_log_line():
-# 
+#
 #         => if the history timestamp is newer than the current line parsed
 #                 => return 0, this file has already been parsed
 #         => if the current line parsed has the same timestamp than the history timestamp
 #                 => go to next line
 #         => if the next line is newer than the history timestamp
 #                 => return 1, the log will be parsed starting from the history size/offset.
-# 
+#
 #   - If more new line (1) has been returned by detect_new_log_line(), move/seek at the start of
 #     of the log and check the timestamp of the first line.
 #         => if the timestamp of the first line is newer than the history timestamp
@@ -4976,7 +4977,7 @@ sub detect_new_log_line
 #                 => return 1, "the file will parsed from history position and history date"
 #   - else
 #         => return 0, "no new line found in this log"
-# 
+#
 sub check_file_changed
 {
 	my ($file, $totalsize, $fmt, $saved_date, $saved_pos, $look_at_beginning) = @_;
@@ -5007,7 +5008,7 @@ sub check_file_changed
 	}
 
 	%prefix_vars = ();
-	
+
 	# If seeking is not explicitely disabled
 	if (!$look_at_beginning)
 	{
