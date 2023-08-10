@@ -53,7 +53,7 @@ use constant EBCDIC => "\t" ne "\011";
 use Encode qw(encode decode);
 use open ':encoding(UTF-8)';
 
-$VERSION = '12.0';
+$VERSION = '12.1';
 
 $SIG{'CHLD'} = 'DEFAULT';
 
@@ -72,7 +72,7 @@ my $MAX_QUERY_LENGTH = 25000;
 my $terminate = 0;
 my %CACHE_DNS = ();
 my $DNSLookupTimeout = 1; # (in seconds)
-my $EXPLAIN_URL = 'http://explain.depesz.com/';
+my $EXPLAIN_URL = 'https://explain.depesz.com/';
 my $EXPLAIN_POST = qq{<form method="POST" target="explain" action="%s"><input type="hidden" name="is_public" value="0"><input type="hidden" name="is_anon" value="0"><input type="hidden" name="plan" value=""></form>};
 my $PID_DIR = $TMP_DIR;
 my $PID_FILE = undef;
@@ -819,7 +819,7 @@ elsif ($#outfiles == -1)
 # Set the default extension and output format, load JSON Perl module if required
 # Force text output with normalized query list only and disable incremental report
 # Set default filename of the output file
-my ($current_out_file, $extens) = &set_output_extension($outfile, $extension);
+my ($current_out_file, $extens) = &set_output_extension($outdir, $outfile, $extension);
 
 # Set default syslog ident name
 $ident ||= 'postgres';
@@ -863,6 +863,7 @@ if ($current_out_file ne '-')
 	}
 	$current_out_file = basename($current_out_file);
 	$current_out_file = ($html_outdir || $outdir) . '/' . $current_out_file;
+	$current_out_file =~ s#//#/#g;
 }
 
 # Remove graph support if output is not html
@@ -1309,186 +1310,223 @@ $tmp_last_parsed = 'tmp_' . basename($last_parsed) if ($last_parsed);
 $tmp_last_parsed = "$TMP_DIR/$tmp_last_parsed";
 $tmp_dblist = "$TMP_DIR/dblist.tmp";
 
-# Clean the incremental directory if the feature is not disabled
-if (!$noclean && $outdir &&
-	($saved_last_line{datetime} || $pgb_saved_last_line{datetime}))
+###
+### Explanation:
+###
+### Logic for the BINARY storage ($outdir) SHOULD be:
+### If ('noclean')
+###   do nothing (keep everything)
+### If (NO 'noclean') and (NO 'retention'):
+###   use an arbitrary retention duration of: 5 weeks
+###   remove BINARY files older than LAST_PARSED_MONTH-retention
+###   DO NOT CHECK for HTML file existence as OLD HTML files may be deleted by external tools
+###     which may lead to BINARY files NEVER deleted
+### If (NO 'noclean') and ('retention'):
+###   remove BINARY files older than LAST_PARSED_MONTH-retention
+###   DO NOT CHECK for HTML file existence as OLD HTML files may be deleted by external tools
+###     which may lead to BINARY files NEVER deleted
+###
+### Logic for the HTML storage ($html_outdir || $outdir) SHOULD be:
+### DO NOT check 'noclean' as this flag is dedicated to BINARY files
+### If (NO 'retention'):
+###   do nothing (keep everything)
+### If ('retention'):
+###   remove HTML folders/files older than LAST_PARSED_MONTH-retention (= y/m/d):
+###   days older than d in y/m/d
+###   months older than m in y/m/d
+###   years older than y in y/m/d
+###
+
+# Clear BIN/HTML storages in incremental mode
+my @all_outdir = ();
+push(@all_outdir, $outdir) if ($outdir);
+push(@all_outdir, $html_outdir) if ($html_outdir);
+### $retention_bin = 5 if (!$noclean && !$retention);
+### $retention_bin = 0 if ($noclean && !$retention);
+### $retention_bin = $retention if (!$noclean && $retention);
+### $retention_bin = 0 if ($noclean && $retention);
+### equivalent to:
+my $retention_bin = $retention;
+$retention_bin = 0 if ($noclean && $retention);
+$retention_bin = 5 if (!$noclean && !$retention);
+### $retention_html = 0 if (!$noclean && !$retention);
+### $retention_html = 0 if ($noclean && !$retention);
+### $retention_html = $retention if (!$noclean && $retention);
+### $retention_html = $retention if ($noclean && $retention);
+### equivalent to:
+my $retention_html = $retention;
+### We will handle noclean/!noclean and retention_xxx/!retention_xxx below
+### Note: !retention_xxx equivalent to retention_xxx = 0
+
+&logmsg('DEBUG', "BIN/HTML Retention cleanup: Initial cleanup flags - noclean=[$noclean] - retention_bin=[$retention_bin] - retention_html=[$retention_html] - saved_last_line{datetime}=[$saved_last_line{datetime}] - pgb_saved_last_line{datetime}=[$pgb_saved_last_line{datetime}] - all_outdir=[@all_outdir]");
+
+if ( scalar(@all_outdir) && ($saved_last_line{datetime} || $pgb_saved_last_line{datetime}) )
 {
 
-	my $last_year  = '';
-	my $last_month = '';
-	my $last_day   = '';
-	# Search the current week following the last parse date
-	if ( ($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) || ($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) )
+	foreach my $ret_dir (@all_outdir)
 	{
-		$last_year  = $1;
-		$last_month = $2;
-		$last_day   = $3;
-	}
-
-	# Get the week number following the date
-	my $wn = &get_week_number($last_year, $last_month, $last_day);
-	# Get the days of the current week where binary files must be preserved
-	my $getwnb = $wn;
-	$getwnb-- if (!$iso_week_number);
-	my @wdays = &get_wdays_per_month($getwnb, "$last_year-$last_month");
-	# Find obsolete dir days that shoud be cleaned
-	unless(opendir(DIR, "$outdir")) {
-		localdie("FATAL: can't opendir $outdir: $!\n");
-	}
-	my @dyears = grep { $_ =~ /^\d+$/ } readdir(DIR);
-	closedir DIR;
-	my @obsolete_days = ();
-	foreach my $y (sort { $a <=> $b } @dyears) {
-		unless(opendir(DIR, "$outdir/$y")) {
-			localdie("FATAL: can't opendir $outdir/$y: $!\n");
-		}
-		my @dmonths = grep { $_ =~ /^\d+$/ } readdir(DIR);
-		closedir DIR;
-		foreach my $m (sort { $a <=> $b } @dmonths) {
-			unless(opendir(DIR, "$outdir/$y/$m")) {
-				localdie("FATAL: can't opendir $outdir/$y/$m: $!\n");
-			}
-			my @ddays = grep { $_ =~ /^\d+$/ } readdir(DIR);
-			closedir DIR;
-			foreach my $d (sort { $a <=> $b } @ddays) {
-				if ("$y-$m-$d" lt $wdays[0]) {
-					push(@obsolete_days, "$outdir/$y/$m/$d");
-				}
-			}
-		}
-	}
-	foreach my $p (@obsolete_days)
-	{
-		unless(opendir(DIR, "$p")) {
-			localdie("FATAL: can't opendir $p: $!\n");
-		}
-		my @hfiles = grep { $_ =~ /\.(html|txt|json)$/i } readdir(DIR);
-		next if ($#hfiles == -1); # do not remove files if report file has not been generated
-		seekdir(DIR, 0);
-		my @bfiles = grep { $_ =~ /\.bin$/i } readdir(DIR);
-		closedir DIR;
-		foreach my $f (@bfiles)
+		if (($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) ||
+					($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /))
 		{
-			&logmsg('DEBUG', "Removing obsolete binary file: $p/$f");
-			unlink("$p/$f");
-		}
-	}
-}
+			# Search the current week following the last parse date
+			my $limit_yw_bin = $1;
+			my $limit_yw_html = $1;
+			my $wn = &get_week_number($1, $2, $3);
+			# BIN: Case of year overlap
+			if (($wn - $retention_bin) < 1)
+			{
+				# Rewind to previous year
+				$limit_yw_bin--;
+				# Get number of last week of previous year, can be 52 or 53
+				my $prevwn = &get_week_number($limit_yw_bin, 12, 31);
+				# Add week number including retention_bin to the previous year
+				$limit_yw_bin .= sprintf("%02d", $prevwn - abs($wn - $retention_bin));
+			} else {
+				$limit_yw_bin .= sprintf("%02d", $wn - $retention_bin);
+			}
+			&logmsg('DEBUG', "BIN Retention cleanup: YearWeek Limit computation - YearWeek=<$limit_yw_bin> - This will help later removal");
+			# HTML: Case of year overlap
+			if (($wn - $retention_html) < 1)
+			{
+				# Rewind to previous year
+				$limit_yw_html--;
+				# Get number of last week of previous year, can be 52 or 53
+				my $prevwn = &get_week_number($limit_yw_html, 12, 31);
+				# Add week number including retention_html to the previous year
+				$limit_yw_html .= sprintf("%02d", $prevwn - abs($wn - $retention_html));
+			} else {
+				$limit_yw_html .= sprintf("%02d", $wn - $retention_html);
+			}
+			&logmsg('DEBUG', "HTML Retention cleanup: YearWeek Limit computation - YearWeek=<$limit_yw_html> - This will help later removal");
 
-# Clear storage when a retention is specified in incremental mode
-if ( $outdir && $retention && ($saved_last_line{datetime} || $pgb_saved_last_line{datetime}) )
-{
-	if (($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) ||
-				($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /))
-	{
-		# Search the current week following the last parse date
-		my $limit = $1;
-		my $wn = &get_week_number($1, $2, $3);
-		# Case of year overlap
-		if (($wn - $retention) < 1)
-		{
-			# Rewind to previous year
-			$limit--;
-			# Get number of last week of previous year, can be 52 or 53
-			my $prevwn = &get_week_number($limit, 12, 31);
-			# Add week number including retention to the previous year
-			$limit .= sprintf("%02d", $prevwn - abs($wn - $retention));
-		} else {
-			$limit .= sprintf("%02d", $wn - $retention);
-		}
-		&logmsg('DEBUG', "Retention cleanup: directories and files older than <$limit> will be removed");
-
-		# Find obsolete weeks dir that shoud be cleaned
-		unless(opendir(DIR, "$outdir")) {
-			localdie("FATAL: can't opendir $outdir: $!\n");
-		}
-		my @dyears = grep { $_ =~ /^\d+$/ } readdir(DIR);
-		closedir DIR;
-		my @obsolete_weeks = ();
-		foreach my $y (sort { $a <=> $b } @dyears) {
-			unless(opendir(DIR, "$outdir/$y")) {
-				localdie("FATAL: can't opendir $outdir/$y: $!\n");
-			}
-			my @weeks = grep { $_ =~ /^week-\d+$/ } readdir(DIR);
-			closedir DIR;
-			foreach my $w (sort { $a <=> $b } @weeks) {
-				$w =~ /^week-(\d+)$/;
-				if ("$y$1" lt $limit) {
-					&logmsg('DEBUG', "Removing obsolete week directory $outdir/$y/week-$1");
-					&cleanup_directory("$outdir/$y/week-$1", 1);
-					push(@obsolete_weeks, "$y$1");
-				}
-			}
-		}
-		# Now removed the corresponding days
-		foreach my $y (sort { $a <=> $b } @dyears) {
-			unless(opendir(DIR, "$outdir/$y")) {
-				localdie("FATAL: can't opendir $outdir/$y: $!\n");
-			}
-			my @dmonths = grep { $_ =~ /^\d+$/ } readdir(DIR);
-			closedir DIR;
-			my @rmmonths = ();
-			foreach my $m (sort { $a <=> $b } @dmonths) {
-				unless(opendir(DIR, "$outdir/$y/$m")) {
-					localdie("FATAL: can't opendir $outdir/$y/$m: $!\n");
-				}
-				my @rmdays = ();
-				my @ddays = grep { $_ =~ /^\d+$/ } readdir(DIR);
+			my @dyears = ();
+			if ( opendir(DIR, "$ret_dir") ) {
+				@dyears = grep { $_ =~ /^\d+$/ } readdir(DIR);
 				closedir DIR;
-				foreach my $d (sort { $a <=> $b } @ddays)
-				{
-					my $weekNumber = '';
-					if (!$iso_week_number)
-					{
-						if (!$week_start_monday) {
-							$weekNumber = sprintf("%02d", POSIX::strftime("%U", 1, 1, 1, $d, $m - 1, $y - 1900)+1);
-						} else {
-							$weekNumber = sprintf("%02d", POSIX::strftime("%W", 1, 1, 1, $d, $m - 1, $y - 1900)+1);
+			} else {
+				&logmsg('ERROR', "BIN/HTML Retention cleanup: can't opendir $ret_dir: $!");
+			}
+			# Find obsolete weeks dir that shoud be cleaned
+			foreach my $y (sort { $a <=> $b } @dyears) {
+				my @weeks = ();
+				if ( opendir(DIR, "$ret_dir/$y") ) {
+					@weeks = grep { $_ =~ /^week-\d+$/ } readdir(DIR);
+					closedir DIR;
+				} else {
+					&logmsg('ERROR', "BIN/HTML Retention cleanup: can't opendir $ret_dir/$y: $!");
+				}
+				foreach my $w (sort { $a <=> $b } @weeks) {
+					$w =~ /^week-(\d+)$/;
+					if ( (!$noclean) && $retention_bin ) {
+						if ("$y$1" lt $limit_yw_bin) {
+							&logmsg('DEBUG', "BIN Retention cleanup: Removing obsolete week directory $ret_dir/$y/week-$1");
+							&cleanup_directory_bin("$ret_dir/$y/week-$1", 1);
 						}
 					}
-					else
-					{
-						$weekNumber = sprintf("%02d", POSIX::strftime("%V", 1, 1, 1, $d, $m - 1, $y - 1900)+1);
-					}
-					if ($#obsolete_weeks >= 0)
-					{
-						if (grep(/^$y$weekNumber$/, @obsolete_weeks))
-						{
-							&logmsg('DEBUG', "Removing obsolete directory $outdir/$y/$m/$d");
-							&cleanup_directory("$outdir/$y/$m/$d", 1);
-							push(@rmdays, $d);
+					if ( $retention_html ) {
+						if ("$y$1" lt $limit_yw_html) {
+							&logmsg('DEBUG', "HTML Retention cleanup: Removing obsolete week directory $ret_dir/$y/week-$1");
+							&cleanup_directory_html("$ret_dir/$y/week-$1", 1);
 						}
 					}
-					else
-					{
-						# Remove obsolete days when we are in binary mode
-						# with noreport - there's no week-N directory
-						my $diff_day = $retention * 7 * 86400;
-						my $oldday = POSIX::strftime("%s", 1,1,1,$d,$m-1,$y-1900);
-						my $lastday = $oldday;
+				}
+			}
+			# Find obsolete months and days
+			foreach my $y (sort { $a <=> $b } @dyears) {
+				my @dmonths = ();
+				if ( opendir(DIR, "$ret_dir/$y") ) {
+					@dmonths = grep { $_ =~ /^\d+$/ } readdir(DIR);
+					closedir DIR;
+				} else {
+					&logmsg('ERROR', "BIN/HTML Retention cleanup: can't opendir $ret_dir/$y: $!");
+				}
+
+				# Now remove the HTML monthly reports
+				if ( $retention_html ) {
+					foreach my $m (sort { $a <=> $b } @dmonths) {
+						my $diff_day = $retention_html * 7 * 86400;
+						my $lastday = 0;
 						if (($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) ||
 							($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /)) {
-							$lastday = POSIX::strftime("%s", 1,1,1,$3,$2-1,$1-1900);
+							$lastday = timelocal(1,1,1,$3,$2-1,$1-1900);
 						}
-						if (($lastday - $oldday) > $diff_day) {
-							&logmsg('DEBUG', "Removing obsolete directory $outdir/$y/$m/$d");
-							&cleanup_directory("$outdir/$y/$m/$d", 1);
-							push(@rmdays, $d);
+						if ( $lastday ) {
+							my $lastday_minus_retention = $lastday - $diff_day;
+							my $lastday_minus_retention_Y = strftime('%Y', localtime($lastday_minus_retention));
+							my $lastday_minus_retention_M = strftime('%m', localtime($lastday_minus_retention));
+
+							my $lastday_minus_retention_prev_month_Y = $lastday_minus_retention_Y;
+							my $lastday_minus_retention_prev_month_M = $lastday_minus_retention_M - 1;
+
+							if ( $lastday_minus_retention_prev_month_M < 1 ) {
+								$lastday_minus_retention_prev_month_Y -= 1;
+								$lastday_minus_retention_prev_month_M = 12;
+							}
+
+							$lastday_minus_retention_prev_month_Y = sprintf("%04d", $lastday_minus_retention_prev_month_Y);
+							$lastday_minus_retention_prev_month_M = sprintf("%02d", $lastday_minus_retention_prev_month_M);
+
+							if ("$y$m" lt "$lastday_minus_retention_Y$lastday_minus_retention_M") {
+								&logmsg('DEBUG', "HTML Retention cleanup: Removing obsolete month directory $ret_dir/$y/$m");
+								&cleanup_directory_html("$ret_dir/$y/$m", 1);
+							}
 						}
 					}
 				}
-				if ($#ddays == $#rmdays) {
-					&logmsg('DEBUG', "Removing obsolete empty directory $outdir/$y/$m");
-					rmdir("$outdir/$y/$m");
-					push(@rmmonths, $m);
+				
+				# Now remove the corresponding days
+				foreach my $m (sort { $a <=> $b } @dmonths) {
+					my @ddays = ();
+					if ( opendir(DIR, "$ret_dir/$y/$m") ) {
+						@ddays = grep { $_ =~ /^\d+$/ } readdir(DIR);
+						closedir DIR;
+					} else {
+						&logmsg('ERROR', "BIN/HTML Retention cleanup: can't opendir $ret_dir/$y/$m: $!");
+					}
+					foreach my $d (sort { $a <=> $b } @ddays)
+					{
+						if ( (!$noclean) && $retention_bin ) {
+							# Remove obsolete days when we are in binary mode
+							# with noreport - there's no week-N directory
+							my $diff_day = $retention_bin * 7 * 86400;
+							my $oldday = timelocal(1,1,1,$d,$m-1,$y-1900);
+							my $lastday = $oldday;
+							if (($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) ||
+								($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /)) {
+								$lastday = timelocal(1,1,1,$3,$2-1,$1-1900);
+							}
+							if (($lastday - $oldday) > $diff_day) {
+								&logmsg('DEBUG', "BIN Retention cleanup: Removing obsolete day directory $ret_dir/$y/$m/$d");
+								&cleanup_directory_bin("$ret_dir/$y/$m/$d", 1);
+							}
+						}
+						if ( $retention_html ) {
+							# Remove obsolete days when we are in binary mode
+							# with noreport - there's no week-N directory
+							my $diff_day = $retention_html * 7 * 86400;
+							my $oldday = timelocal(1,1,1,$d,$m-1,$y-1900);
+							my $lastday = $oldday;
+							if (($saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /) ||
+								($pgb_saved_last_line{datetime} =~ /^(\d+)\-(\d+)\-(\d+) /)) {
+								$lastday = timelocal(1,1,1,$3,$2-1,$1-1900);
+							}
+							if (($lastday - $oldday) > $diff_day) {
+								&logmsg('DEBUG', "HTML Retention cleanup: Removing obsolete day directory $ret_dir/$y/$m/$d");
+								&cleanup_directory_html("$ret_dir/$y/$m/$d", 1);
+							}
+						}
+					}
+					if ( rmdir("$ret_dir/$y/$m") ) {
+						&logmsg('DEBUG', "BIN/HTML Retention cleanup: Removing obsolete empty directory $ret_dir/$y/$m");
+					}
 				}
-			}
-			if ($#dmonths == $#rmmonths) {
-				&logmsg('DEBUG', "Removing obsolete empty directory $outdir/$y");
-				rmdir("$outdir/$y");
+				if ( rmdir("$ret_dir/$y") ) {
+					&logmsg('DEBUG', "BIN/HTML Retention cleanup: Removing obsolete empty directory $ret_dir/$y");
+				}
 			}
 		}
 	}
+
 }
 
 # Main loop reading log files
@@ -2079,8 +2117,10 @@ Options:
 			     defined in your postgresql.conf. Only use it if you
 			     aren't using one of the standard prefixes specified
 			     in the pgBadger documentation, such as if your
-			     prefix includes additional variables like client ip
-			     or application name. See examples below.
+			     prefix includes additional variables like client IP
+			     or application name. MUST contain escape sequences
+			     for time (%t, %m or %n) and processes (%p or %c).
+			     See examples below.
     -P | --no-prettify     : disable SQL queries prettify formatter.
     -q | --quiet	   : don't print anything to stdout, not even a progress
 			     bar.
@@ -2337,6 +2377,10 @@ the log format use `jsonlog`:
 This is the same as with the jsonlog extension, the json format is different
 but pgBadger can parse both formats.
 
+pgBadger also supports logs produced by CloudNativePG Postgres operator for Kubernetes:
+
+    pgbadger -f jsonlog -o cnpg_out.html cnpg.log
+
 To create a cumulative report over a month use command:
 
     pgbadger --month-report 2919-05 /path/to/incremental/reports/
@@ -2362,7 +2406,7 @@ sub gen_database_report
 
 	foreach $outfile (@outfiles)
 	{
-		($current_out_file, $extens) = &set_output_extension($outfile, $extension, $db);
+		($current_out_file, $extens) = &set_output_extension($outdir, $outfile, $extension, $db);
 
 		$extens = $dft_extens if ($current_out_file eq '-' && $dft_extens);
 
@@ -3184,6 +3228,32 @@ sub cleanup_directory
 }
 
 
+sub cleanup_directory_bin
+{
+	my ($dir, $remove_dir) = @_;
+
+	if (opendir(DIR, "$dir")) {
+		my @todel = grep { $_ =~ /\.bin$/i } readdir(DIR);
+		closedir DIR;
+		map { unlink("$dir/$_"); } @todel;
+		rmdir("$dir") if ($remove_dir);
+	}
+}
+
+
+sub cleanup_directory_html
+{
+	my ($dir, $remove_dir) = @_;
+
+	if (opendir(DIR, "$dir")) {
+		my @todel = grep { $_ =~ /\.(html|txt|tsung|json)$/i } readdir(DIR);
+		closedir DIR;
+		map { unlink("$dir/$_"); } @todel;
+		rmdir("$dir") if ($remove_dir);
+	}
+}
+
+
 sub write_resources
 {
 	# Write resource file to report directory or return resources in and array of lines
@@ -3433,8 +3503,6 @@ sub process_file
 
 	my $curdate = localtime(time);
 
-	$pipe->writer() if (defined $pipe);
-
 	# Syslog does not have year information, so take care of year overlapping
 	my ($gsec, $gmin, $ghour, $gmday, $gmon, $gyear, $gwday, $gyday, $gisdst) = localtime(time);
 	$gyear += 1900;
@@ -3444,6 +3512,14 @@ sub process_file
 
 	# Get a filehandle to the log file
 	my $lfile = &get_log_file($logfile, $totalsize);
+	if (!defined $lfile)
+	{
+		&logmsg('ERROR', "cannot read file $logfile, no handle.");
+		return;
+	}
+
+	$pipe->writer() if (defined $pipe);
+
 	if ($logfile ne '-')
 	{
 		if ($progress && ($getout != 1))
@@ -3675,16 +3751,17 @@ sub process_file
 				}
 				else
 				{
-					# pgBouncer Statistics appears each minutes in the log
-					if ($prefix_vars{'t_query'} =~ /(\d+) req\/s, in (\d+) b\/s, out (\d+) b\/s,query (\d+) us/)
+					# pgBouncer Statistics appear each minute in the log
+					if ($prefix_vars{'t_query'} =~ /(\d+) req\/s, in (\d+) b\/s, out (\d+) b\/s,query (\d+) us, wait time (\d+) us/)
 					{
 						$prefix_vars{'t_loglevel'} = 'STATS';
 						$prefix_vars{'t_req/s'} = $1;
 						$prefix_vars{'t_inbytes/s'} = $2;
 						$prefix_vars{'t_outbytes/s'} = $3;
 						$prefix_vars{'t_avgduration'} = $4;
+						$prefix_vars{'t_avgwaiting'} = $5;
 					}
-					elsif ($prefix_vars{'t_query'} =~ /(\d+) xacts\/s, (\d+) queries\/s, in (\d+) B\/s, out (\d+) B\/s, xact (\d+) us, query (\d+) us/)
+					elsif ($prefix_vars{'t_query'} =~ /(\d+) xacts\/s, (\d+) queries\/s, in (\d+) B\/s, out (\d+) B\/s, xact (\d+) us, query (\d+) us, wait time (\d+) us/)
 					{
 						$prefix_vars{'t_loglevel'} = 'STATS';
 						$prefix_vars{'t_xact/s'} = $1;
@@ -3693,6 +3770,7 @@ sub process_file
 						$prefix_vars{'t_outbytes/s'} = $4;
 						$prefix_vars{'t_avgtxduration'} = $5;
 						$prefix_vars{'t_avgduration'} = $6;
+						$prefix_vars{'t_avgwaiting'} = $7;
 					}
 				}
 
@@ -4539,6 +4617,13 @@ sub parse_jsonlog_input
 {
 	my $str = shift;
 
+
+	# This is Azure json log input
+	return parse_jsonazure_input($str) if ($str =~ /"record_application_name_s"/);
+
+	# This is CloudNativePG json log input
+	return parse_jsoncnpg_input($str) if ($str =~ /"logging_pod"/);
+
 	my %infos = ();
 
 	# json columns information from jsonlog extension:
@@ -4570,7 +4655,6 @@ sub parse_jsonlog_input
 	# query id *
 	#
 	# (*) information not available for the moment
-
 
 	# Extract the date
 	if ($str =~ m/[\{,]"timestamp":\s*"(\d+)-(\d+)-(\d+).(\d+):(\d+):(\d+)/)
@@ -4660,6 +4744,209 @@ sub parse_jsonlog_input
 	return %infos;
 }
 
+sub parse_jsonazure_input
+{
+	my $str = shift;
+
+	my %infos = ();
+
+	# json columns information from Azure Log Analytics Workspaces
+	# ------------------------------------------------------------
+	# TableName
+	# record_application_name_s
+	# record_backend_type_s
+	# record_command_tag_s
+	# record_connection_from_s
+	# record_context_s
+	# record_database_name_s
+	# record_detail_s
+	# record_error_severity_s
+	# record_hint_s
+	# record_log_time_s
+	# record_message_s
+	# record_process_id_s
+	# record_query_id_s
+	# record_query_pos_s
+	# record_query_s
+	# record_session_id_s
+	# record_session_line_num_s
+	# record_session_start_time_s
+	# record_sql_state_code_s
+	# record_transaction_id_s
+	# record_user_name_s
+	# record_virtual_transaction_id_s
+
+	# Extract the date
+	if ($str =~ m/"record_log_time_s":\s*"(\d+)-(\d+)-(\d+).(\d+):(\d+):(\d+)/)
+	{
+		$infos{'t_year'} = $1;
+		$infos{'t_month'} = $2;
+		$infos{'t_day'} = $3;
+		$infos{'t_hour'} = $4;
+		$infos{'t_min'} = $5;
+		$infos{'t_sec'} = $6;
+		$infos{'t_timestamp'} = "$infos{'t_year'}-$infos{'t_month'}-$infos{'t_day'} $infos{'t_hour'}:$infos{'t_min'}:$infos{'t_sec'}";
+    $infos{'t_time'} = "$infos{'t_hour'}:$infos{'t_min'}:$infos{'t_sec'}";
+	}
+
+	if ($str =~ m/"record_user_name_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_dbuser'}  = $1;
+	}
+	if ($str =~ m/"record_database_name_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_dbname'}  = $1;
+	}
+	if ($str =~ m/"record_application_name_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_appname'} = $1;
+	}
+	if ($str =~ m/"record_connection_from_s":\s*"(.*?)"(?:,\s*"|\})/)
+	{
+		$infos{'t_client'}  = $1;
+		$infos{'t_client'}  =~ s/:.*//;
+		$infos{'t_client'} = _gethostbyaddr($infos{'t_client'}) if ($dns_resolv && $infos{'t_client'} ne '[local]');
+	}
+	$infos{'t_host'}    = 'jsonlog'; # this unused variable is used to store format information when log format is not syslog
+
+	if ($str =~ m/"record_process_id_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_pid'} = $1;
+	}
+
+	if ($str =~ m/"record_error_severity_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_loglevel'} = $1;
+	}
+	if ($str =~ m/"record_sql_state_code_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_sqlstate'} = $1;
+	}
+	if ($str =~ m/"record_query_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_query'} = unescape_jsonlog($1);
+	}
+
+	# Set ERROR additional information
+	if ($str =~ m/"record_detail_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_detail'} = unescape_jsonlog($1);
+	}
+	if ($str =~ m/"record_hint_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_hint'} = unescape_jsonlog($1);
+	}
+	if ($str =~ m/"record_context_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_context'} = unescape_jsonlog($1);
+	}
+
+	# Backend type information
+	if ($str =~ m/"record_backend_type_s":\s*"(.*?)"(?:,\s*"|\})/) {
+		$infos{'t_backend_type'} = $1;
+	}
+
+	return %infos;
+}
+
+sub parse_jsoncnpg_input
+{
+	my $str = shift;
+
+	my %infos = ();
+
+	# json log line from CloudNativePG Operator:
+	# -------------------------------------------------
+	# {
+	#   "level": "info",
+	#   "ts": 1619781249.7188137,
+	#   "logger": "postgres",
+	#   "msg": "record",
+	#   "record": {
+	#     "log_time": "2021-04-30 11:14:09.718 UTC",
+	#     "user_name": "",
+	#     "database_name": "",
+	#     "process_id": "25",
+	#     "connection_from": "",
+	#     "session_id": "608be681.19",
+	#     "session_line_num": "1",
+	#     "command_tag": "",
+	#     "session_start_time": "2021-04-30 11:14:09 UTC",
+	#     "virtual_transaction_id": "",
+	#     "transaction_id": "0",
+	#     "error_severity": "LOG",
+	#     "sql_state_code": "00000",
+	#     "message": "database system was interrupted; last known up at 2021-04-30 11:14:07 UTC",
+	#     "detail": "",
+	#     "hint": "",
+	#     "internal_query": "",
+	#     "internal_query_pos": "",
+	#     "context": "",
+	#     "query": "",
+	#     "query_pos": "",
+	#     "location": "",
+	#     "application_name": "",
+	#     "backend_type": "startup"
+	#   },
+	#   "logging_pod": "cluster-example-1",
+	# }
+
+	# Extract the date
+	if ($str =~ m/[\{,]"log_time":\s*"(\d+)-(\d+)-(\d+).(\d+):(\d+):(\d+)/)
+	{
+		$infos{'t_year'} = $1;
+		$infos{'t_month'} = $2;
+		$infos{'t_day'} = $3;
+		$infos{'t_hour'} = $4;
+		$infos{'t_min'} = $5;
+		$infos{'t_sec'} = $6;
+		$infos{'t_timestamp'} = "$infos{'t_year'}-$infos{'t_month'}-$infos{'t_day'} $infos{'t_hour'}:$infos{'t_min'}:$infos{'t_sec'}";
+    $infos{'t_time'} = "$infos{'t_hour'}:$infos{'t_min'}:$infos{'t_sec'}";
+	}
+
+	# Set query parameters as global variables
+	if ($str =~ m/"user_name":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_dbuser'}  = $1;
+	}
+	if ($str =~ m/"database_name":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_dbname'}  = $1;
+	}
+	if ($str =~ m/"application_name":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_appname'} = $1;
+	}
+	if ($str =~ m/"connection_from":\s*"(.*?)"(?:,"|\})/)
+	{
+		$infos{'t_client'}  = $1;
+		$infos{'t_client'}  =~ s/:.*//;
+		$infos{'t_client'} = _gethostbyaddr($infos{'t_client'}) if ($dns_resolv);
+	}
+	$infos{'t_host'}    = 'jsonlog'; # this unused variable is used to store format information when log format is not syslog
+
+	if ($str =~ m/"process_id":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_pid'} = $1;
+	}
+
+	if ($str =~ m/"error_severity":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_loglevel'} = $1;
+	}
+	if ($str =~ m/"sql_state_code":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_sqlstate'} = $1;
+	}
+	if ($str =~ m/"message":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_query'} = unescape_jsonlog($1);
+	}
+
+	# Set ERROR additional information
+	if ($str =~ m/"detail":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_detail'} = unescape_jsonlog($1);
+	}
+	if ($str =~ m/"hint":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_hint'} = unescape_jsonlog($1);
+	}
+	if ($str =~ m/"context":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_context'} = unescape_jsonlog($1);
+	}
+	if ($str =~ m/"internal_query":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_statement'} = unescape_jsonlog($1);
+	}
+
+	# Backend type information
+	if ($str =~ m/"backend_type":\s*"(.*?)"(?:,"|\})/) {
+		$infos{'t_backend_type'} = $1;
+	}
+
+	return %infos;
+}
 
 sub parse_orphan_line
 {
@@ -4715,11 +5002,16 @@ sub parse_orphan_line
 		}
 	}
 	# stores bind parameters if parameter syntax is detected
-	elsif ( $cur_info{$cur_pid}{parameters})
+	elsif ( $cur_info{$cur_pid}{parameters} || $cur_bind_info{$cur_pid})
 	{
 		if (!$error_only)
 		{
-			$cur_info{$cur_pid}{parameters} .= ' '  if ($cur_info{$cur_pid}{parameters} =~ /=$/);
+			if ($cur_info{$cur_pid}{parameters} =~ /=$/) {
+				$cur_info{$cur_pid}{parameters} .= ' ';
+				$cur_bind_info{$cur_pid}{'bind'}{'parameters'} .= ' ' if (exists $cur_bind_info{$cur_pid}{'bind'}{'parameters'});
+			}
+			$line =~ s/^\t+/\\n/;
+			$cur_bind_info{$cur_pid}{'bind'}{'parameters'} .= $line if (exists $cur_bind_info{$cur_pid}{'bind'}{'parameters'});
 			$cur_info{$cur_pid}{parameters} .= "$line";
 		}
 	}
@@ -6450,6 +6742,8 @@ sub change_log_level
 	return 1 if ($msg =~ /still waiting for/);
 	return 1 if ($msg =~ /server process.*was terminated by signal/);
 	return 1 if ($msg =~ /could not (receive|send) data (from|to) client/);
+	return 1 if ($msg =~ /logical decoding found consistent point at/);
+	return 1 if ($msg =~ /starting logical decoding for slot/);
 
 	return 0;
 }
@@ -6468,6 +6762,8 @@ sub revert_log_level
 	return ($msg, 1) if ($msg =~ s/ERROR:  (.*still waiting for)/LOG:  $1/);
 	return ($msg, 1) if ($msg =~ s/ERROR:  (server process.*was terminated by signal)/LOG:  $1/);
 	return ($msg, 1) if ($msg =~ s/ERROR:  (could not (?:receive|send) data (?:from|to) client)/LOG:  $1/);
+	return ($msg, 1) if ($msg =~ s/ERROR:  (logical decoding found consistent point at)/LOG:  $1/);
+	return ($msg, 1) if ($msg =~ s/ERROR:  (starting logical decoding for slot)/LOG:  $1/);
 
 	return ($msg, 0);
 }
@@ -6848,7 +7144,7 @@ $EXPLAIN_POST
 			print $fh qq{
      				<li><a href="#pgbsql-traffic">Request Throughput</a></li>
      				<li><a href="#pgbbytes-traffic">Bytes I/O Throughput</a></li>
-     				<li><a href="#pgbduration-traffic">Queries Average duration</a></li>
+     				<li><a href="#pgbduration-traffic">Average Query Duration</a></li>
 				<li class="divider"></li>
      				<li><a href="#pgbsimultaneous-sessions">Simultaneous sessions</a></li>
 };
@@ -7595,6 +7891,14 @@ sub print_pgbouncer_stats
 		last;
 	}
 
+	my $avgwaiting_peak = 0;
+	my $avgwaiting_peak_date = '';
+	foreach (sort {$pgb_overall_stat{'peak'}{$b}{t_avgwaiting} <=> $pgb_overall_stat{'peak'}{$a}{t_avgwaiting}} keys %{$pgb_overall_stat{'peak'}}) {
+		$avgwaiting_peak = &convert_time($pgb_overall_stat{'peak'}{$_}{t_avgwaiting});
+		$avgwaiting_peak_date = $_;
+		last;
+	}
+
 	print $fh qq{
 	<div id="pgbsql-traffic" class="analysis-item row">
 		<h2 class="col-md-12"><i class="glyphicon icon-road"></i> Request Throughput</h2>
@@ -7637,7 +7941,7 @@ $drawn_graphs{pgb_bytepersecond_graph}
 
 	print $fh qq{
 	<div id="pgbduration-traffic" class="analysis-item row">
-		<h2 class="col-md-12"><i class="glyphicon icon-time"></i> Queries Average duration</h2>
+		<h2 class="col-md-12"><i class="glyphicon icon-time"></i> Average Query Duration</h2>
 		<div class="col-md-3">
 			<h3 class="">Key values</h3>
 			<div class="well key-figures">
@@ -7653,6 +7957,26 @@ $drawn_graphs{pgb_avgduration_graph}
 	</div><!-- end of duration-traffic -->
 };
 	delete $drawn_graphs{pgb_avgduration_graph};
+
+	print $fh qq{
+	<div id="pgbwaiting-traffic" class="analysis-item row">
+		<h2 class="col-md-12"><i class="glyphicon icon-time"></i> Average Waiting Time</h2>
+		<div class="col-md-3">
+			<h3 class="">Key values</h3>
+			<div class="well key-figures">
+				<ul>
+					<li><span class="figure">$avgwaiting_peak</span> <span class="figure-label">Average Waiting Peak</span></li>
+					<li><span class="figure">$avgwaiting_peak_date</span> <span class="figure-label">Date</span></li>
+				</ul>
+			</div>
+		</div>
+		<div class="col-md-9">
+$drawn_graphs{pgb_avgwaiting_graph}
+		</div>
+	</div><!-- end of waiting-traffic -->
+};
+	delete $drawn_graphs{pgb_avgwaiting_graph};
+
 
 }
 
@@ -7921,6 +8245,7 @@ sub compute_pgbouncer_graphs
 					$graph_data{'inbytes'} .= "[$t, " . ($pgb_per_minute_info{$tm}{$h}{$m}{t_inbytes} || 0) . "],";
 					$graph_data{'outbytes'} .= "[$t, " . ($pgb_per_minute_info{$tm}{$h}{$m}{t_outbytes} || 0) . "],";
 					$graph_data{'avgduration'} .= "[$t, " . ($pgb_per_minute_info{$tm}{$h}{$m}{t_avgduration} || 0) . "],";
+					$graph_data{'avgwaiting'} .= "[$t, " . ($pgb_per_minute_info{$tm}{$h}{$m}{t_avgwaiting} || 0) . "],";
 					next if (!exists $pgb_per_minute_info{$tm}{$h}{$m});
 
 					my $rd = &average_per_minutes($m, $avg_minutes);
@@ -7994,6 +8319,8 @@ sub compute_pgbouncer_graphs
 	$drawn_graphs{'pgb_bytepersecond_graph'} = &jqplot_linegraph( $graphid++, 'pgb_bytepersecond_graph', $graph_data{inbytes},$graph_data{'outbytes'},'','Bytes I/O per seconds (1 minute average)', 'size', 'In b/s', 'Out b/s');
 
 	$drawn_graphs{'pgb_avgduration_graph'} = &jqplot_linegraph( $graphid++, 'pgb_avgduration_graph', $graph_data{avgduration},'','', 'Average query duration (1 minute average)', 'duration', 'Duration');
+
+	$drawn_graphs{'pgb_avgwaiting_graph'} = &jqplot_linegraph( $graphid++, 'pgb_avgwaiting_graph', $graph_data{avgwaiting},'','', 'Average waiting time (1 minute average)', 'waiting', 'Waiting');
 
 	$drawn_graphs{'pgb_connectionspersecond_graph'} = &jqplot_linegraph( $graphid++, 'pgb_connectionspersecond_graph', $graph_data{conn_max},
 		$graph_data{conn_avg}, $graph_data{conn_min}, 'Connections per second (' . $avg_minutes . ' minutes average)',
@@ -14599,6 +14926,7 @@ sub load_stats
 		$pgb_overall_stat{peak}{$k}{t_inbytes} += $_pgb_overall_stat{peak}{$k}{t_inbytes};
 		$pgb_overall_stat{peak}{$k}{t_outbytes} += $_pgb_overall_stat{peak}{$k}{t_outbytes};
 		$pgb_overall_stat{peak}{$k}{t_avgduration} += $_pgb_overall_stat{peak}{$k}{t_avgduration};
+		$pgb_overall_stat{peak}{$k}{t_avgwaiting} += $_pgb_overall_stat{peak}{$k}{t_avgwaiting};
 	}
 
 	foreach my $k (keys %{$_pgb_overall_stat{histogram}{session_time}}) {
@@ -14928,6 +15256,8 @@ sub load_stats
 					($_pgb_per_minute_info{$day}{$hour}{$min}{t_outbytes} || 0);
 				$pgb_per_minute_info{$day}{$hour}{$min}{t_avgduration} +=
 					($_pgb_per_minute_info{$day}{$hour}{$min}{t_avgduration} || 0);
+				$pgb_per_minute_info{$day}{$hour}{$min}{t_avgwaiting} +=
+					($_pgb_per_minute_info{$day}{$hour}{$min}{t_avgwaiting} || 0);
 			}
 		}
 	}
@@ -15691,6 +16021,10 @@ sub validate_log_line
 				}
 			}
 		}
+		if ( !$prefix_vars{'t_appname'} && ($prefix_vars{'t_query'} =~ /connection authorized: user=([^\s]+) application_name=([^\s]+)/) ) {
+					$prefix_vars{'t_appname'} = $2;
+					$current_sessions{$prefix_vars{'t_pid'}}{appname} = $2;
+		}
 	}
 
 	# Set details from previous connection line
@@ -16153,16 +16487,14 @@ sub parse_query
 	{
 		$current_sessions{$t_pid}{user} = $1;
 		$current_sessions{$t_pid}{database} = $2;
-		if ($prefix_vars{'t_query'} =~ /application_name=(.*)/)
+		if ($prefix_vars{'t_query'} =~ /connection authorized: user=([^\s]+) application_name=([^\s]+)/
+			|| $prefix_vars{'t_query'} =~ /(.*)application_name=(.*)/)
 		{
-			if ($1)
-			{
-				$prefix_vars{'t_appname'} = $1;
-				$current_sessions{$t_pid}{appname} = $1;
-			}
+			$prefix_vars{'t_appname'} = $2;
+			$current_sessions{$t_pid}{appname} = $2;
 		}
 
-		return if ($disable_connection);
+		return if ($disable_connection || $prefix_vars{'t_query'} =~ /connection authorized: user=([^\s]+) application_name=([^\s]+)/);
 
 		my $usr = $current_sessions{$t_pid}{user} || '';
 		my $db  = $current_sessions{$t_pid}{database} || 'unknown';
@@ -16724,6 +17056,10 @@ sub parse_pgbouncer
 		$pgb_per_minute_info{$date_part}{$prefix_vars{'t_hour'}}{$prefix_vars{'t_min'}}{t_avgduration} = $duration;
 		$pgb_overall_stat{'peak'}{$cur_last_log_timestamp}{t_avgduration} = $duration;
 
+		my $waiting = int($prefix_vars{'t_avgwaiting'}/1000);
+		$pgb_per_minute_info{$date_part}{$prefix_vars{'t_hour'}}{$prefix_vars{'t_min'}}{t_avgwaiting} = $waiting;
+		$pgb_overall_stat{'peak'}{$cur_last_log_timestamp}{t_avgwaiting} = $waiting;
+
 		return;
 
 	} elsif ($prefix_vars{'t_loglevel'} =~ $main_error_regex) {
@@ -16919,7 +17255,7 @@ sub store_queries
 		# Replace bind parameters values in the query if any
 		if (exists $cur_info{$t_pid}{parameters} && ($cur_info{$t_pid}{parameters} =~ /[,\s]*\$(\d+)\s=\s/))
 		{
-			my @t_res = $cur_info{$t_pid}{parameters} =~ /\$\d+\s=\s(.*?)(?:,|$)/g;
+			my @t_res = $cur_info{$t_pid}{parameters} =~ /\$\d+\s=\s(.*?)(?:, |$)/g;
 			$cur_info{$t_pid}{query} =~ s/\$(\d+)/$t_res[$1-1]/gs;
 		}
 		else
@@ -16958,7 +17294,7 @@ sub store_queries
 	# Replace bind parameters values in the query if any
 	if (exists $cur_info{$t_pid}{parameters} && ($cur_info{$t_pid}{parameters} =~ /[,\s]*\$(\d+)\s=\s/))
 	{
-		my @t_res = $cur_info{$t_pid}{parameters} =~ /\$\d+\s=\s(.*?)(?:,|$)/g;
+		my @t_res = $cur_info{$t_pid}{parameters} =~ /\$\d+\s=\s(.*?)(?:, |$)/g;
 		$cur_info{$t_pid}{query} =~ s/\$(\d+)/$t_res[$1-1]/gs;
 	}
 	else
@@ -17602,6 +17938,8 @@ sub normalize_error
 	$orig_query =~ s/(side location conflict at ).*/$1 .../;
 	$orig_query =~ s/(permission denied for [^\s]+) .*/$1 .../;
 	$orig_query =~ s/(database) (?:.*)? (must be vacuumed within) \d+ (transactions)/$1 "..." $2 ... $3/;
+	$orig_query =~ s/(logical decoding found consistent point at).*/$1 "..."/;
+	$orig_query =~ s/(starting logical decoding for slot).*/$1 "..."/;
 
 	# Need more normalization stuff here
 	return $orig_query;
@@ -17793,6 +18131,11 @@ sub search_log_format
 	}
 	# cloudsql lines
 	elsif ($line =~ /"textPayload":\s*"(?:\d+-\d+-\d+[T\s]\d+:\d+:\d+\.\d+\s[^\s]*\s+\[(\d+)\]:.*)",$/)
+	{
+		$fmt = 'jsonlog';
+	}
+	# cnpg lines
+	elsif ($line =~ /"logging_pod":\s*.+"record":/)
 	{
 		$fmt = 'jsonlog';
 	}
@@ -18143,10 +18486,10 @@ sub build_log_line_prefix_regex
 		'%p' => [('t_pid',	  '(\d+)')],		# process ID
 		'%Q' => [('t_queryid',	  '([\-]*\d+)')],	# Query ID
 		'%n' => [('t_epoch',    '(\d{10}\.\d{3})')],    # timestamp as Unix epoch
-		'%t' => [('t_timestamp',    '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[Z]*(?: [A-Z\+\-\d]{3,6})?')],      # timestamp without milliseconds
-		'%m' => [('t_mtimestamp',   '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+(?: [A-Z\+\-\d]{3,6})?')], # timestamp with milliseconds
+		'%t' => [('t_timestamp',    '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[Z]*(?:[ \+\-][A-Z\+\-\d]{3,6})?')],      # timestamp without milliseconds
+		'%m' => [('t_mtimestamp',   '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})\.\d+(?:[ \+\-][A-Z\+\-\d]{3,6})?')], # timestamp with milliseconds
 		'%l' => [('t_session_line', '(\d+)')],							# session line number
-		'%s' => [('t_session_timestamp', '(\d{4}-\d{2}-\d{2} \d{2}):\d{2}:\d{2}(?: [A-Z\+\-\d]{3,6})?')],    # session start timestamp
+		'%s' => [('t_session_timestamp', '(\d{4}-\d{2}-\d{2}[\sT]\d{2}):\d{2}:\d{2}(?:[ \+\-][A-Z\+\-\d]{3,6})?')],    # session start timestamp
 		'%c' => [('t_session_id',	'([0-9a-f\.]*)')],					       # session ID
 		'%v' => [('t_virtual_xid',       '([0-9a-f\.\/]*)')],					     # virtual transaction ID
 		'%x' => [('t_xid',	       '([0-9a-f\.\/]*)')],					     # transaction ID
@@ -18995,7 +19338,7 @@ sub change_timezone
 # Set default filename of the output file
 sub set_output_extension
 {
-	my ($of, $ext, $db) = @_;
+	my ($od, $of, $ext, $db) = @_;
 
 	if (!$ext)
 	{
@@ -19051,6 +19394,9 @@ sub set_output_extension
 
 	# Append the current database name to the output file.
 	$of = $db . '_' . $of if ($db && $report_per_database && $db ne $DBALL && $of ne '-');
+
+	# Add the destination directory
+	$of = $od . '/' . $of if ($od && $of !~ m#^\Q$od\E#);
 
 	&logmsg('DEBUG', "Output '$ext' reports will be written to $of") if (!$rebuild && !$report_per_database);
 
@@ -23464,7 +23810,7 @@ Please report any bugs or feature requests to: https://github.com/darold/pgForma
 
 =head1 COPYRIGHT
 
-Copyright 2012-2022 Gilles Darold. All rights reserved.
+Copyright 2012-2023 Gilles Darold. All rights reserved.
 
 =head1 LICENSE
 

@@ -209,7 +209,7 @@ Options:
     --no-week              : inform pgbadger to not build weekly reports in
                              incremental mode. Useful if it takes too much time.
     --explain-url URL      : use it to override the url of the graphical explain
-                             tool. Default: http://explain.depesz.com/
+                             tool. Default: https://explain.depesz.com/
     --tempdir DIR          : set directory where temporary files will be written
                              Default: File::Spec->tmpdir() || '/tmp'
     --no-process-info      : disable changing process title to help identify
@@ -345,6 +345,10 @@ the log format use \`jsonlog\`:
 This is the same as with the jsonlog extension, the json format is different
 but pgBadger can parse both formats.
 
+pgBadger also supports logs produced by CloudNativePG Postgres operator for Kubernetes:
+
+    pgbadger -f jsonlog -o cnpg_out.html cnpg.log
+
 To create a cumulative report over a month use command:
 
     pgbadger --month-report 2919-05 /path/to/incremental/reports/
@@ -437,7 +441,7 @@ reports:
 
         Request Throughput
         Bytes I/O Throughput
-        Queries Average duration
+        Average Query Duration
         Simultaneous sessions
         Histogram of sessions times
         Sessions per database
@@ -783,7 +787,7 @@ Many people have contributed to pgBadger, they are all quoted in the Changelog f
 
 pgBadger is free software distributed under the PostgreSQL Licence.
 
-Copyright (c) 2012-2022, Gilles Darold
+Copyright (c) 2012-2023, Gilles Darold
 
 A modified version of the SQL::Beautify Perl Module is embedded in pgBadger
 with copyright (C) 2009 by Jonas Kramer and is published under the terms of
