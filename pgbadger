@@ -43,7 +43,7 @@ use Time::Local qw(timegm_nocheck timelocal_nocheck timegm timelocal);
 use POSIX qw(locale_h sys_wait_h _exit strftime);
 setlocale(LC_NUMERIC, '');
 setlocale(LC_ALL,     'C');
-use File::Spec qw/ tmpdir /;
+use File::Spec;
 use File::Temp qw/ tempfile /;
 use IO::Handle;
 use IO::Pipe;
@@ -53,7 +53,7 @@ use constant EBCDIC => "\t" ne "\011";
 use Encode qw(encode decode);
 use open ':encoding(UTF-8)';
 
-$VERSION = '12.4';
+$VERSION = '13.1';
 
 $SIG{'CHLD'} = 'DEFAULT';
 
@@ -395,7 +395,9 @@ my $ssh_identity = '';
 my $ssh_user = '';
 my $ssh_timeout = 10;
 my $ssh_options = "-o ConnectTimeout=$ssh_timeout -o PreferredAuthentications=hostbased,publickey";
+my $ssh_sudo = 0;
 my $force_sample = 0;
+my $nofork = 0;
 
 my $curl_command = 'curl -k -s ';
 
@@ -460,9 +462,14 @@ $SIG{INT} = \&wait_child;
 $SIG{TERM} = \&wait_child;
 if ($^O !~ /MSWin32|dos/i) {
 	$SIG{USR2} = \&stop_parsing;
+} else {
+	$nofork = 1;
 }
 
 $| = 1;
+
+my $histogram_query = '';
+my $histogram_session = '';
 
 # get the command line parameters
 my $result = GetOptions(
@@ -540,6 +547,7 @@ my $result = GetOptions(
 	'ssh-port=i'	           => \$ssh_port,
 	'ssh-identity=s'	   => \$ssh_identity,
 	'ssh-option=s'	           => \$ssh_options,
+	'ssh-sudo!'		   => \$ssh_sudo,
 	'ssh-user=s'	           => \$ssh_user,
 	'ssh-timeout=i'	           => \$ssh_timeout,
 	'anonymize!'	           => \$anonymize,
@@ -571,6 +579,9 @@ my $result = GetOptions(
 	'dump-raw-csv!'            => \$dump_raw_csv,
 	'include-pid=i'            => \@include_pid,
 	'include-session=s'        => \@include_session,
+	'histogram-query=s'        => \$histogram_query,
+	'histogram-session=s'      => \$histogram_session,
+	'no-fork'                  => \$nofork,
 );
 die "FATAL: use pgbadger --help\n" if (not $result);
 
@@ -882,12 +893,13 @@ my $end_top = $top - 1;
 $queue_size ||= 1;
 $job_per_file ||= 1;
 
-if ($^O =~ /MSWin32|dos/i) {
+if ($^O =~ /MSWin32|dos/i)
+{
 	if ( ($queue_size > 1) || ($job_per_file > 1) ) {
 		print STDERR "WARNING: parallel processing is not supported on this platform.\n";
-		$queue_size = 1;
-		$job_per_file = 1;
 	}
+	$queue_size = 1;
+	$job_per_file = 1;
 }
 
 # Test file creation before going to parse log
@@ -1038,6 +1050,23 @@ my @histogram_query_time = (0, 1, 5, 10, 25, 50, 100, 500, 1000, 10000);
 
 # Inbounds of session times histogram
 my @histogram_session_time = (0, 500, 1000, 30000, 60000, 600000, 1800000, 3600000, 28800000);
+
+# Check histogram values user redefinition
+if ($histogram_query)
+{
+	if ($histogram_query =~ /[^0-9\s,]+/) {
+		die("Incorrect value for option --histogram_query\n");
+	}
+	@histogram_query_time = split(/\s*,\s*/, $histogram_query);
+}
+if ($histogram_session)
+{
+	if ($histogram_session =~ /[^0-9\s,]+/) {
+		die("Incorrect value for option --histogram_session\n");
+	}
+	@histogram_session_time = split(/\s*,\s*/, $histogram_session);
+}
+
 
 # Where statistics are stored
 my %overall_stat	= ();
@@ -1659,7 +1688,7 @@ my $parallel_process = 0;
 my $reader = new IO::Handle;
 my $writer = new IO::Handle;
 # Fork the logger process
-if ($^O !~ /MSWin32|dos/i && $progress)
+if (!$nofork && $progress)
 {
 	$pipe = IO::Pipe->new($reader, $writer);
 	$writer->autoflush(1);
@@ -1680,8 +1709,10 @@ $DBLIST{$DBALL} = 1;
 $job_per_file = ($#given_log_files+1) if ( ($job_per_file > 1) && ($job_per_file > ($#given_log_files+1)) );
 
 # Parse each log file following the multiprocess mode chosen (-j or -J)
+my $current_log_file = '';
 foreach my $logfile ( @given_log_files )
 {
+	$current_log_file = $logfile if ($#given_log_files > 0);
 
 	# If we just want to build incremental reports from binary files
 	# just build the list of input directories with binary files
@@ -1719,7 +1750,7 @@ foreach my $logfile ( @given_log_files )
 	}
 	else
 	{
-		&logmsg('DEBUG', "parallel processing will not ne used.");
+		&logmsg('DEBUG', "parallel processing will not be used.");
 		$parallel_process = 1;
 	}
 
@@ -1796,7 +1827,7 @@ foreach my $logfile ( @given_log_files )
 	else
 	{
 		# Start parsing one file per parallel process
-		if ($^O !~ /MSWin32|dos/i)
+		if (!$nofork)
 		{
 			push(@tempfiles, [ tempfile('tmp_pgbadgerXXXX', SUFFIX => '.bin', DIR => $TMP_DIR, UNLINK => 1 ) ]);
 			spawn sub
@@ -1827,7 +1858,7 @@ while (scalar keys %RUNNING_PIDS > $progress)
 }
 
 # Terminate the process logger
-if ($^O !~ /MSWin32|dos/i)
+if (!$nofork)
 {
 	foreach my $k (keys %RUNNING_PIDS)
 	{
@@ -1840,13 +1871,16 @@ if ($^O !~ /MSWin32|dos/i)
 }
 
 # Load all data gathered by all the different processes
-foreach my $f (@tempfiles)
+if (!$nofork)
 {
-	next if (!-e "$f->[1]" || -z "$f->[1]");
-	my $fht = new IO::File;
-	$fht->open("< $f->[1]") or localdie("FATAL: can't open temp file $f->[1], $!\n");
-	load_stats($fht);
-	$fht->close();
+	foreach my $f (@tempfiles)
+	{
+		next if (!-e "$f->[1]" || -z "$f->[1]");
+		my $fht = new IO::File;
+		$fht->open("< $f->[1]") or localdie("FATAL: can't open temp file $f->[1], $!\n");
+		load_stats($fht);
+		$fht->close();
+	}
 }
 
 # Get last line parsed from all process
@@ -1982,7 +2016,7 @@ if ( !$incremental && ($#given_log_files >= 0) )
 	{
 		next if (!$db);
 
-		if ($^O =~ /MSWin32|dos/i || $parallel_process <= 1) {
+		if ($nofork || $parallel_process <= 1) {
 			&gen_database_report($db);
 		}
 		else
@@ -2006,7 +2040,7 @@ if ( !$incremental && ($#given_log_files >= 0) )
 		}
 	}
 
-	if ($^O !~ /MSWin32|dos/i && $parallel_process > 1)
+	if (!$nofork && $parallel_process > 1)
 	{
 		while (scalar keys %RUNNING_PIDS > $progress)
 		{
@@ -2022,7 +2056,8 @@ elsif (!$incremental || !$noreport)
 {
 	# Look for directory where report must be generated
 	my @build_directories = ();
-	if (-e "$last_parsed.tmp") {
+	if (-e "$last_parsed.tmp")
+	{
 		if (open(my $in, '<', "$last_parsed.tmp")) {
 			while (my $l = <$in>) {
 				chomp($l);
@@ -2269,6 +2304,13 @@ Options:
                              Can be used multiple time.
     --include-session ID   : only report events related to the session id (\%c).
                              Can be used multiple time.
+   --histogram-query VAL   : use custom inbound for query times histogram.
+                             Default inbound in milliseconds:
+			 0,1,5,10,25,50,100,500,1000,10000
+   --histogram-session VAL : use custom inbound for session times histogram.
+                             Default inbound in milliseconds:
+			 0,500,1000,30000,60000,600000,1800000,3600000,28800000
+   --no-fork               : do not fork any process, for debugging purpose.
 
 pgBadger is able to parse a remote log file using a passwordless ssh connection.
 Use -r or --remote-host to set the host IP address or hostname. There are also
@@ -2416,10 +2458,6 @@ sub gen_database_report
 {
 	my $db = shift;
 
-	# Some message have been temporary stored as ERROR but
-	# they are LOG, restore them to the right log level.
-	&restore_log_type_count($db);
-
 	foreach $outfile (@outfiles)
 	{
 		($current_out_file, $extens) = &set_output_extension($outdir, $outfile, $extension, $db);
@@ -2477,6 +2515,15 @@ sub confirm_multiprocess
 {
 	my $file = shift;
 
+	if (!$nofork && $progress)
+	{
+		# Not supported on Windows
+		if ($queue_size > 1) {
+			&logmsg('DEBUG', "parallel processing is not supported on this plateform.");
+		}
+		return 0;
+	}
+
 	if ($remote_host || $file =~ /^(http[s]*|ftp[s]*|ssh):/) {
 
 		# Disable multi process when using ssh to parse remote log
@@ -2521,7 +2568,6 @@ sub set_ssh_command
 	} else {
 		$ssh_cmd .= " $rhost";
 	}
-
 	if (wantarray()) {
 		return ($ssh_cmd, $fmt);
 	} else {
@@ -2587,7 +2633,10 @@ sub set_file_list
 			if ($file !~ /^ssh:/)
 			{
 				my($filename, $dirs, $suffix) = fileparse($file);
-				&logmsg('DEBUG', "Looking for remote filename using command: $remote_command \"ls '$dirs'$filename\"");
+				my $ssh_command_ls = "\"";
+				$ssh_command_ls .= "sudo " if ($ssh_sudo);
+				$ssh_command_ls .= "ls '$dirs'$filename\"";
+				&logmsg('DEBUG', "Looking for remote filename using command: $remote_command $ssh_command_ls");
 				my @rfiles = `$remote_command "ls '$dirs'$filename"`;
 				foreach my $f (@rfiles)
 				{
@@ -2605,8 +2654,11 @@ sub set_file_list
 				$ssh .= " -i $ssh_identity" if ($ssh_identity);
 				$ssh .= " $ssh_options" if ($ssh_options);
 				my($filename, $dirs, $suffix) = fileparse($file);
-				&logmsg('DEBUG', "Looking for remote filename using command: $ssh $host_info \"ls '$dirs'$filename\"");
-				my @rfiles = `$ssh $host_info "ls '$dirs'$filename"`;
+				my $ssh_command_ls = "\"";
+				$ssh_command_ls .= "sudo " if ($ssh_sudo);
+				$ssh_command_ls .= "ls '$dirs'$filename\"";
+				&logmsg('DEBUG', "Looking for remote filename using command: $ssh $host_info $ssh_command_ls");
+				my @rfiles = `$ssh $host_info $ssh_command_ls`;
 				$dirs = '' if ( $filename ne '' ); #ls returns relative paths for an directory but absolute ones for a file or filename pattern
 				foreach my $f (@rfiles)
 				{
@@ -2707,11 +2759,11 @@ sub set_parser_regex
 		if ($fmt eq 'syslog')
 		{
 			$llp =
-				  '^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(?:\.\d+)?(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*'
+				  '^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(\.\d+)?(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*'
 				. $llp
 				. '\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)';
 			$compiled_prefix = qr/$llp/;
-			unshift(@prefix_params, 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_host', 't_ident', 't_pid', 't_session_line');
+			unshift(@prefix_params, 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_ms', 't_host', 't_ident', 't_pid', 't_session_line');
 			push(@prefix_params, 't_loglevel', 't_query');
 			$other_syslog_line = qr/^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*(.*)/;
 		}
@@ -2732,11 +2784,11 @@ sub set_parser_regex
 		       # The output format of the heroku pg logs is as follows: timestamp app[dyno]: message
 
 		       $llp =
-				 '^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(?:\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[postgres\.(\d+)\][:]?\s+\[([^\]]+)\]\s+\[\d+\-\d+\]\s+'
+				 '^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[postgres\.(\d+)\][:]?\s+\[([^\]]+)\]\s+\[\d+\-\d+\]\s+'
 			       . $llp
 			       . '\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(.*)';
 		       $compiled_prefix = qr/$llp/;
-		       unshift(@prefix_params, 't_year', 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_pid', 't_dbname');
+		       unshift(@prefix_params, 't_year', 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_ms', 't_pid', 't_dbname');
 		       push(@prefix_params, 't_loglevel', 't_query');
 		       $other_syslog_line = qr/^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(?:\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[postgres\.\d+\][:]?\s+\[([^\]]+)\]\s+\[(\d+)\-(\d+)\]\s*(.*)/;
 		}
@@ -2771,8 +2823,8 @@ sub set_parser_regex
 	elsif ($fmt eq 'syslog')
 	{
 		$compiled_prefix =
-	qr/^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(?:\.\d+)?(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
-		push(@prefix_params, 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_host', 't_ident', 't_pid', 't_session_line',
+	qr/^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(\.\d+)?(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
+		push(@prefix_params, 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_ms', 't_host', 't_ident', 't_pid', 't_session_line',
 			't_logprefix', 't_loglevel', 't_query');
 		$other_syslog_line = qr/^(...)\s+(\d+)\s(\d+):(\d+):(\d+)(?:\.\d+)?(?:\s[^\s]+)?\s([^\s]+)\s([^\s\[]+)\[(\d+)\]:(?:\s\[[^\]]+\])?\s\[(\d+)(?:\-\d+)?\]\s*(.*)/;
 	}
@@ -2789,8 +2841,8 @@ sub set_parser_regex
 	{
 	       # The output format of the heroku pg logs is as follows: timestamp app[dyno]: message
 	       $compiled_prefix =
-			 qr/^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(?:\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[postgres\.(\d+)\][:]?\s+\[([^\]]+)\]\s+\[\d+\-\d+\]\s+(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(.*)/;
-	       unshift(@prefix_params, 't_year', 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_pid', 't_dbname');
+			 qr/^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[postgres\.(\d+)\][:]?\s+\[([^\]]+)\]\s+\[\d+\-\d+\]\s+(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(.*)/;
+	       unshift(@prefix_params, 't_year', 't_month', 't_day', 't_hour', 't_min', 't_sec', 't_ms', 't_pid', 't_dbname');
 	       push(@prefix_params, 't_logprefix', 't_loglevel', 't_query');
 	       $other_syslog_line = qr/^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(?:\.\d+)?[+\-]\d{2}:\d{2}\s+(?:[^\s]+)?\s*app\[(postgres)\.(\d+)\][:]?\s+\[([^\]]+)\]\s+\[\d+\-\d+\]\s*(.*)/;
 	}
@@ -2814,15 +2866,15 @@ sub set_parser_regex
 	elsif ($fmt eq 'stderr')
 	{
 		$compiled_prefix =
-	qr/^(\d{10}\.\d{3}|\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})[\.\d]*(?: [A-Z\+\-\d]{3,6})?\s\[([0-9a-f\.]+)\][:]*\s(?:\[\d+\-\d+\])?\s*(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
-		push(@prefix_params, 't_timestamp', 't_pid', 't_logprefix', 't_loglevel', 't_query');
+	qr/^(\d{10}\.\d{3}|\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(\.\d+)?(?: [A-Z\+\-\d]{3,6})?\s\[([0-9a-f\.]+)\][:]*\s(?:\[\d+\-\d+\])?\s*(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
+		push(@prefix_params, 't_timestamp', 't_ms', 't_pid', 't_logprefix', 't_loglevel', 't_query');
 	}
 	elsif ($fmt eq 'default')
 	{
 		$fmt = 'stderr';
 		$compiled_prefix =
-	qr/^(\d{10}\.\d{3}|\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})[\.\d]*(?: [A-Z\+\-\d]{3,6})?\s\[([0-9a-f\.]+)\][:]*\s(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
-		push(@prefix_params, 't_timestamp', 't_pid', 't_logprefix', 't_loglevel', 't_query');
+	qr/^(\d{10}\.\d{3}|\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(\.\d+)?(?: [A-Z\+\-\d]{3,6})?\s\[([0-9a-f\.]+)\][:]*\s(.*?)\s*(LOG|WARNING|ERROR|FATAL|PANIC|DETAIL|STATEMENT|HINT|CONTEXT|LOCATION):\s+(?:[0-9A-Z]{5}:\s+)?(.*)/;
+		push(@prefix_params, 't_timestamp', 't_ms', 't_pid', 't_logprefix', 't_loglevel', 't_query');
 	}
 
 	return $fmt;
@@ -3768,7 +3820,7 @@ sub process_file
 				else
 				{
 					# pgBouncer Statistics appear each minute in the log
-					if ($prefix_vars{'t_query'} =~ /(\d+) req\/s, in (\d+) b\/s, out (\d+) b\/s,query (\d+) us, wait time (\d+) us/)
+					if ($prefix_vars{'t_query'} =~ /(\d+) req\/s, in (\d+) b\/s, out (\d+) b\/s,query (\d+) us, wait(?: time)? (\d+) us/)
 					{
 						$prefix_vars{'t_loglevel'} = 'STATS';
 						$prefix_vars{'t_req/s'} = $1;
@@ -3777,7 +3829,7 @@ sub process_file
 						$prefix_vars{'t_avgduration'} = $4;
 						$prefix_vars{'t_avgwaiting'} = $5;
 					}
-					elsif ($prefix_vars{'t_query'} =~ /(\d+) xacts\/s, (\d+) queries\/s, in (\d+) B\/s, out (\d+) B\/s, xact (\d+) us, query (\d+) us, wait time (\d+) us/)
+					elsif ($prefix_vars{'t_query'} =~ /(\d+) xacts\/s, (\d+) queries\/s, in (\d+) B\/s, out (\d+) B\/s, xact (\d+) us, query (\d+) us, wait(?: time)? (\d+) us/)
 					{
 						$prefix_vars{'t_loglevel'} = 'STATS';
 						$prefix_vars{'t_xact/s'} = $1;
@@ -3907,9 +3959,12 @@ sub process_file
 					$prefix_vars{'t_timestamp'} =
 						"$prefix_vars{'t_year'}-$prefix_vars{'t_month'}-$prefix_vars{'t_day'} $prefix_vars{'t_time'}";
 
-					# Remove newline characters from queries
-					for (my $i = 0; $i <= $#$row; $i++) {
-						$row->[$i] =~ s/[\r\n]+/ /gs;
+					# Remove newline characters from queries but not explain plan
+					if (!grep(/Query Text:/, @$row))
+					{
+						for (my $i = 0; $i <= $#$row; $i++) {
+							$row->[$i] =~ s/[\r\n]+/ /gs;
+						}
 					}
 
 					# Skip unwanted lines
@@ -4078,6 +4133,10 @@ sub process_file
 
 					# Skip location information
 					next if ($prefix_vars{'t_loglevel'} eq 'LOCATION');
+
+					if ($prefix_vars{'t_mtimestamp'} && $prefix_vars{'t_mtimestamp'} =~ s/(\.\d+)$//) {
+						$prefix_vars{'t_ms'} = $1;
+					}
 
 					if (!$prefix_vars{'t_timestamp'} && $prefix_vars{'t_mtimestamp'}) {
 						$prefix_vars{'t_timestamp'} = $prefix_vars{'t_mtimestamp'};
@@ -4371,6 +4430,10 @@ sub process_file
 					# Skip location information
 					next if ($prefix_vars{'t_loglevel'} eq 'LOCATION');
 
+					if ($prefix_vars{'t_mtimestamp'} && $prefix_vars{'t_mtimestamp'} =~ s/(\.\d+)$//) {
+						$prefix_vars{'t_ms'} = $1;
+					}
+
 					if (!$prefix_vars{'t_timestamp'} && $prefix_vars{'t_mtimestamp'}) {
 						$prefix_vars{'t_timestamp'} = $prefix_vars{'t_mtimestamp'};
 					} elsif (!$prefix_vars{'t_timestamp'} && $prefix_vars{'t_session_timestamp'}) {
@@ -4501,7 +4564,7 @@ sub process_file
 	close $lfile;
 
 	# Inform the parent that it should stop parsing other files
-	if ($terminate)
+	if (!$nofork && $terminate)
 	{
 		if ($^O !~ /MSWin32|dos/i) {
 			kill('USR2', $parent_pid);
@@ -4641,7 +4704,7 @@ sub process_file
 	}
 
 	# Inform the parent that it should stop parsing other files
-	if ($getout) {
+	if (!$nofork && $getout) {
 		if ($^O !~ /MSWin32|dos/i) {
 			kill('USR2', $parent_pid);
 		} else {
@@ -5031,7 +5094,7 @@ sub parse_orphan_line
 	}
 
 	# Store vacuum related information
-	if ($cur_info{$cur_pid}{vacuum} && ($line =~ /^[\s\t]*(pages|tuples|buffer usage|avg read rate|system usage|WAL usage):/))
+	if ($cur_info{$cur_pid}{vacuum} && ($line =~ /^[\s\t]*(pages|tuples|buffer usage|avg read rate|system usage|WAL usage|I\/O timings|frozen):/))
 	{
 		if ($line =~ /(pages|tuples): (\d+) removed, (\d+) remain/) {
 			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{$1}{removed} += $2;
@@ -5040,10 +5103,22 @@ sub parse_orphan_line
 		if ($line =~ /(\d+) are dead but not yet removable/) {
 			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{tuples}{notremovable} += $1;
 		}
+
+		if ($line =~ /timings: read: ([\d\.]+) ms, write: ([\d\.]+) ms/)
+		{
+			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{read} += $1;
+			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{write} += $2;
+		}
+		if ($line =~ /frozen: (\d+) pages from table .* had (\d+) tuples frozen/)
+		{
+			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{pages}{frozen} += $1;
+			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{tuples}{frozen} += $2;
+		}
 		if ($line =~ /^[\s\t]*system usage: CPU: user: (.*) (?:sec|s,) system: (.*) (?:sec|s,) elapsed: ([^\s]+)/)
 		{
+			$autovacuum_info{$curdb}{tables}{$cur_info{$cur_pid}{vacuum}}{elapsed} += $3;
 			# Add vacuum counts and duration to the $per_minute_info.
-			$per_minute_info{$curdb}{$date_part}{$cur_info{$cur_pid}{hour}}{$cur_info{$cur_pid}{min}}{autovacuum}{count}++;
+			# $per_minute_info{$curdb}{$date_part}{$cur_info{$cur_pid}{hour}}{$cur_info{$cur_pid}{min}}{autovacuum}{count}++; # Duplicate to parse_query() -> Store autovacuum information
 			$per_minute_info{$curdb}{$date_part}{$cur_info{$cur_pid}{hour}}{$cur_info{$cur_pid}{min}}{autovacuum}{second}{$cur_info{$cur_pid}{second}} += $3;
 			if ($3 > $autovacuum_info{$curdb}{peak}{system_usage}{elapsed})
 			{
@@ -5085,11 +5160,15 @@ sub parse_orphan_line
 				}
 				$line =~ s/^\t+/\\n/;
 				$cur_bind_info{$cur_pid}{'bind'}{'parameters'} .= $line if (exists $cur_bind_info{$cur_pid}{'bind'}{'parameters'});
-				$cur_info{$cur_pid}{parameters} .= "$line";
+				$cur_info{$cur_pid}{parameters} .= $line;
+			}
+			elsif (exists $cur_bind_info{$cur_pid}{bind}{'query'} && !exists $cur_info{$cur_pid}{query})
+			{
+				$cur_bind_info{$cur_pid}{bind}{'query'} .= $line;
 			}
 			else
 			{
-				$cur_info{$cur_pid}{query} .= "$line";
+				$cur_info{$cur_pid}{query} .= $line;
 			}
 		}
 	}
@@ -5131,7 +5210,7 @@ sub parse_orphan_line
 		# After all append to the query if one is defined
 		} elsif (exists $cur_info{$cur_pid}{query}) {
 			$cur_info{$cur_pid}{query} .= "\n" . $line if (!$nomultiline && !$error_only);
-		# Associate to bind|prepare query now that& we collect it too
+		# Associate to bind|prepare query now that we collect it too
 		} elsif (exists $cur_bind_info{$cur_pid}{'bind'}) {
 			$cur_bind_info{$cur_pid}{'bind'}{'query'} .= "\n" . $line;
 		} elsif (exists $cur_bind_info{$cur_pid}{'prepare'}) {
@@ -5231,6 +5310,9 @@ sub detect_new_log_line
 				}
 
 				$prefix_vars{'t_client'} =~ s/\(.*// if ($fmt eq 'rds');
+				if ($prefix_vars{'t_mtimestamp'} && $prefix_vars{'t_mtimestamp'} =~ s/(\.\d+)$//) {
+					$prefix_vars{'t_ms'} = $1;
+				}
 				if (!$prefix_vars{'t_timestamp'} && $prefix_vars{'t_mtimestamp'}) {
 					$prefix_vars{'t_timestamp'} = $prefix_vars{'t_mtimestamp'};
 				} elsif (!$prefix_vars{'t_timestamp'} && $prefix_vars{'t_session_timestamp'}) {
@@ -5942,7 +6024,7 @@ sub set_top_slowest
 # Stores top N slowest sample queries
 sub set_top_sample
 {
-	my ($curdb, $norm, $q, $dt, $date, $db, $user, $remote, $app, $bind, $plan, $queryid) = @_;
+	my ($curdb, $norm, $q, $dt, $date, $db, $user, $remote, $app, $bind, $plan, $queryid, $lfile) = @_;
 
 	return if (!$norm || !$q || $sample <= 0);
 
@@ -5955,6 +6037,7 @@ sub set_top_sample
 	$normalyzed_info{$curdb}{$norm}{samples}{$dt}{bind}	= $bind;
 	$normalyzed_info{$curdb}{$norm}{samples}{$dt}{plan}	= $plan;
 	$normalyzed_info{$curdb}{$norm}{samples}{$dt}{queryid}	= $queryid;
+	$normalyzed_info{$curdb}{$norm}{samples}{$dt}{logfile}	= $lfile;
 
 	my $i = 1;
 	foreach my $k (sort {$b <=> $a} keys %{$normalyzed_info{$curdb}{$norm}{samples}}) {
@@ -5968,7 +6051,7 @@ sub set_top_sample
 # Stores top N error sample queries
 sub set_top_error_sample
 {
-	my ($curdb, $q, $date, $real_error, $detail, $context, $statement, $hint, $db, $user, $app, $remote, $sqlstate, $queryid) = @_;
+	my ($curdb, $q, $date, $real_error, $detail, $context, $statement, $hint, $db, $user, $app, $remote, $sqlstate, $queryid, $lfile) = @_;
 
 	$errors_code{$curdb}{$sqlstate}++ if ($sqlstate);
 
@@ -5989,6 +6072,7 @@ sub set_top_error_sample
 			push(@{$error_info{$curdb}{$q}{remote}},    $remote);
 			push(@{$error_info{$curdb}{$q}{sqlstate}},  $sqlstate);
 			push(@{$error_info{$curdb}{$q}{queryid}},   $queryid);
+			push(@{$error_info{$curdb}{$q}{logfile}},   $lfile);
 		}
 	}
 }
@@ -6371,6 +6455,7 @@ Report not supported by text format
 				$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 				$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 				$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+				$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 				$db =~ s/^, / - /;
 				print $fh "\t- Example $j: ", &convert_time($d), "$db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 				$j++;
@@ -6436,6 +6521,7 @@ Report not supported by text format
 					$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 					$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 					$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+					$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 					$db =~ s/^, / - /;
 					print $fh "\t- Example $j: ", &convert_time($d), " - $db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 					$j++;
@@ -6498,6 +6584,7 @@ Report not supported by text format
 					$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 					$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 					$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+					$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 					$db =~ s/^, / - /;
 					print $fh "\t- Example $j: ", &convert_time($d), " - $db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 					$j++;
@@ -6577,6 +6664,7 @@ Report not supported by text format
 				$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 				$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 				$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+				$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 				$db =~ s/^, / - /;
 				print $fh "\t- Example $j: ", &convert_time($d), "$db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 				$j++;
@@ -6618,6 +6706,7 @@ Report not supported by text format
 				$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 				$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 				$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+				$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 				$db =~ s/^, / - /;
 				print $fh "\tExample $i: ", &convert_time($d), "$db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 				$i++;
@@ -6659,6 +6748,7 @@ Report not supported by text format
 				$db .= ", app: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 				$db .= ", queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 				$db .= ", bind query: yes" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{yes});
+				$db .= ", log file: " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 				$db =~ s/^, / - /;
 				print $fh "\tExample $i: ", &convert_time($d), "$db - ", &anonymize_query($normalyzed_info{$curdb}{$k}{samples}{$d}{query}), "\n";
 				$i++;
@@ -6822,6 +6912,9 @@ sub change_log_level
 	return 1 if ($msg =~ /could not (receive|send) data (from|to) client/);
 	return 1 if ($msg =~ /logical decoding found consistent point at/);
 	return 1 if ($msg =~ /starting logical decoding for slot/);
+	return 1 if ($msg =~ /unexpected EOF/);
+	return 1 if ($msg =~ /incomplete startup packet/);
+	return 1 if ($msg =~ /detected deadlock while waiting for/);
 
 	return 0;
 }
@@ -6846,6 +6939,24 @@ sub revert_log_level
 	return ($msg, 0);
 }
 
+sub revert_log_level_by_reference
+{
+	my $str = shift;
+
+	$$str =~ s/ERROR:  (parameter "[^"]+" changed to)/LOG:  $1/;
+	$$str =~ s/ERROR:  (database system was)/LOG:  $1/;
+	$$str =~ s/ERROR:  (recovery has paused)/LOG:  $1/;
+	$$str =~ s/ERROR:  (sending cancel to blocking autovacuum)/LOG:  $1/;
+	$$str =~ s/ERROR:  (skipping analyze of)/LOG:  $1/;
+	$$str =~ s/ERROR:  (using stale statistics)/LOG:  $1/;
+	$$str =~ s/ERROR:  (received replication command:)/LOG:  $1/;
+	$$str =~ s/ERROR:  (.*still waiting for)/LOG:  $1/;
+	$$str =~ s/ERROR:  (server process.*was terminated by signal)/LOG:  $1/;
+	$$str =~ s/ERROR:  (could not (?:receive|send) data (?:from|to) client)/LOG:  $1/;
+	$$str =~ s/ERROR:  (logical decoding found consistent point at)/LOG:  $1/;
+	$$str =~ s/ERROR:  (starting logical decoding for slot)/LOG:  $1/;
+}
+
 sub show_error_as_text
 {
 	my $curdb = shift;
@@ -6868,12 +6979,6 @@ sub show_error_as_text
 			my $j = 1;
 			for (my $i = 0 ; $i <= $#{$error_info{$curdb}{$k}{date}} ; $i++)
 			{
-				($msg, $ret) = &revert_log_level($error_info{$curdb}{$k}{error}[$i]);
-				if ($msg && ($logs_type{$curdb}{ERROR} > 0))
-				{
-					$logs_type{$curdb}{ERROR}--;
-					$logs_type{$curdb}{LOG}++;
-				}
 				next if ($i == $sample);
 				print $fh "\t- Example $j: $error_info{$curdb}{$k}{date}[$i] - $error_info{$curdb}{$k}{error}[$i]\n";
 				print $fh "\t\tDetail: $error_info{$curdb}{$k}{detail}[$i]\n"       if ($error_info{$curdb}{$k}{detail}[$i]);
@@ -6882,17 +6987,13 @@ sub show_error_as_text
 				print $fh "\t\tStatement: ", &anonymize_query($error_info{$curdb}{$k}{statement}[$i]), "\n" if ($error_info{$curdb}{$k}{statement}[$i]);
 				print $fh "\t\tQueryid: $error_info{$curdb}{$k}{queryid}[$i]\n" if ($error_info{$curdb}{$k}{queryid}[$i]);
 				print $fh "\t\tDatabase: $error_info{$curdb}{$k}{db}[$i]\n" if ($error_info{$curdb}{$k}{db}[$i]);
+				print $fh "\t\tLog file: $error_info{$curdb}{$k}{logfile}[$i]\n" if ($error_info{$curdb}{$k}{logfile}[$i]);
 				$j++;
 			}
 		}
 		elsif ($error_info{$curdb}{$k}{error}[0])
 		{
 			($msg, $ret) = &revert_log_level($error_info{$curdb}{$k}{error}[0]);
-			if ($msg && ($logs_type{$curdb}{ERROR} > 0))
-			{
-				$logs_type{$curdb}{ERROR}--;
-				$logs_type{$curdb}{LOG}++;
-			}
 			if ($sample)
 			{
 				print $fh "$idx) " . &comma_numbers($error_info{$curdb}{$k}{count}) . " - $error_info{$curdb}{$k}{error}[0]\n";
@@ -6904,19 +7005,12 @@ sub show_error_as_text
 				print $fh "\t\tStatement: ", &anonymize_query($error_info{$curdb}{$k}{statement}[0]), "\n" if ($error_info{$curdb}{$k}{statement}[0]);
 				print $fh "\t\tQueryid: $error_info{$curdb}{$k}{queryid}[0]\n" if ($error_info{$curdb}{$k}{queryid}[0]);
 				print $fh "\t\tDatabase: $error_info{$curdb}{$k}{db}[0]\n" if ($error_info{$curdb}{$k}{db}[0]);
+				print $fh "\t\tLog file: $error_info{$curdb}{$k}{logfile}[0]\n" if ($error_info{$curdb}{$k}{logfile}[0]);
 			}
 			else
 			{
 				print $fh "$idx) " . &comma_numbers($error_info{$curdb}{$k}{count}) . " - $msg\n";
 				print $fh "--\n";
-			}
-		}
-		else
-		{
-			if ($msg && ($logs_type{$curdb}{ERROR} > 0))
-			{
-				$logs_type{$curdb}{ERROR}--;
-				$logs_type{$curdb}{LOG}++;
 			}
 		}
 		$idx++;
@@ -7146,6 +7240,7 @@ $EXPLAIN_POST
      				<li><a href="#vacuums-activity">Vacuums activity</a></li>
      				<li><a href="#analyzes-per-table">Analyzes per Tables</a></li>
      				<li><a href="#vacuums-per-table">Vacuums per Tables</a></li>
+     				<li><a href="#vacuums-elapsed-per-table">Vacuums throughput</a></li>
      				<li><a href="#tuples-removed-per-table">Tuples removed</a></li>
      				<li><a href="#pages-removed-per-table">Page removed</a></li>
      			</ul>
@@ -10641,7 +10736,7 @@ sub print_vacuum
 						$v_dataavg{vmin}{"$rd"} = $per_minute_info{$curdb}{$tm}{$h}{$m}{autovacuum}{second}{$s}
 							if ($per_minute_info{$curdb}{$tm}{$h}{$m}{autovacuum}{second}{$d} < $v_dataavg{vmin}{"$rd"});
 					}
-					delete $per_minute_info{$curdb}{$tm}{$h}{$m}{autovacuum};
+					# delete $per_minute_info{$curdb}{$tm}{$h}{$m}{autovacuum}; # Used in report printing the #vacuums-activity
 				}
 				if (exists $per_minute_info{$curdb}{$tm}{$h}{$m}{autoanalyze}) {
 					$v_dataavg{acount}{"$rd"} += ($per_minute_info{$curdb}{$tm}{$h}{$m}{autoanalyze}{count} || 0);
@@ -10767,6 +10862,7 @@ $drawn_graphs{autovacuumspersecond_graph}
 
 	# VACUUM stats per table
 	&print_vacuum_per_table($curdb);
+	&print_vacuum_throughput($curdb);
 
 	# Show tuples and pages removed per table
 	&print_vacuum_tuple_removed($curdb);
@@ -10849,11 +10945,13 @@ sub print_vacuum_per_table
 	my $total_hits = 0;
 	my $total_misses = 0;
 	my $total_dirtied = 0;
-	my $total_pins = 0;
-	my $total_frozen = 0;
+	my $total_skippins = 0;
+	my $total_skipfrozen = 0;
 	my $total_records = 0;
 	my $total_full_page = 0;
 	my $total_bytes = 0;
+	my $total_pages_frozen = 0;
+	my $total_tuples_frozen = 0;
 	my $vacuum_info   = '';
 	my @main_vacuum   = ('unknown',0);
 	foreach my $t (sort {
@@ -10870,17 +10968,21 @@ sub print_vacuum_per_table
 			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{wal_record}) .
 			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{wal_full_page}) .
 			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{wal_bytes}) .
+			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{pages}{frozen}) .
+			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{tuples}{frozen}) .
 			"</td></tr>";
 		$total_count += $autovacuum_info{$curdb}{tables}{$t}{vacuums};
 		$total_idxscan += $autovacuum_info{$curdb}{tables}{$t}{idxscans};
 		$total_hits += $autovacuum_info{$curdb}{tables}{$t}{hits};
 		$total_misses += $autovacuum_info{$curdb}{tables}{$t}{misses};
 		$total_dirtied += $autovacuum_info{$curdb}{tables}{$t}{dirtied};
-		$total_pins += $autovacuum_info{$curdb}{tables}{$t}{skip_pins};
-		$total_frozen += $autovacuum_info{$curdb}{tables}{$t}{skip_frozen};
+		$total_skippins += $autovacuum_info{$curdb}{tables}{$t}{skip_pins};
+		$total_skipfrozen += $autovacuum_info{$curdb}{tables}{$t}{skip_frozen};
 		$total_records += $autovacuum_info{$curdb}{tables}{$t}{wal_record};
 		$total_full_page += $autovacuum_info{$curdb}{tables}{$t}{wal_full_page};
 		$total_bytes += $autovacuum_info{$curdb}{tables}{$t}{wal_bytes};
+		$total_pages_frozen += $autovacuum_info{$curdb}{tables}{$t}{pages}{frozen};
+		$total_tuples_frozen += $autovacuum_info{$curdb}{tables}{$t}{tuples}{frozen};
 		if ($main_vacuum[1] < $autovacuum_info{$curdb}{tables}{$t}{vacuums})
 		{
 			$main_vacuum[0] = $t;
@@ -10892,11 +10994,13 @@ sub print_vacuum_per_table
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_hits);
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_misses);
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_dirtied);
-	$vacuum_info .= "</td><td>" . &comma_numbers($total_pins);
-	$vacuum_info .= "</td><td>" . &comma_numbers($total_frozen);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_skippins);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_skipfrozen);
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_records);
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_full_page);
 	$vacuum_info .= "</td><td>" . &comma_numbers($total_bytes);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_pages_frozen);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_tuples_frozen);
 	$vacuum_info .= "</td></tr>";
 
 	my %infos = ();
@@ -10952,7 +11056,7 @@ sub print_vacuum_per_table
 					<div class="tab-pane" id="vacuums-per-table-table">
 						<table class="table table-striped table-hover">
 							<thead>
-								<tr><th colspan="2">&nbsp;</th><th style="text-align:center;">Index</th><th colspan="3" style="text-align:center;">Buffer usage</th><th colspan="2" style="text-align:center;">Skipped</th><th colspan="3" style="text-align:center;">WAL usage</th>
+								<tr><th colspan="2">&nbsp;</th><th style="text-align:center;">Index</th><th colspan="3" style="text-align:center;">Buffer usage</th><th colspan="2" style="text-align:center;">Skipped</th><th colspan="3" style="text-align:center;">WAL usage</th><th colspan="2" style="text-align:center;">Frozen</th>
 								<tr>
 									<th>Table</th>
 									<th>Vacuums</th>
@@ -10965,6 +11069,8 @@ sub print_vacuum_per_table
 									<th>records</th>
 									<th>full page</th>
 									<th>bytes</th>
+									<th>pages</th>
+									<th>tuples</th>
 								</tr>
 							</thead>
 							<tbody>
@@ -10980,6 +11086,130 @@ sub print_vacuum_per_table
 	delete $drawn_graphs{tablevacuums_graph};
 
 }
+
+sub print_vacuum_throughput
+{
+	my $curdb = shift;
+
+	# VACUUM stats per table
+	my $total_read = 0;
+	my $total_write = 0;
+	my $total_elapsed = 0;
+	my $vacuum_info  = '';
+	my @main_elapsed = ('unknown',0);
+	my @main_write   = ('unknown',0);
+	my @main_read   = ('unknown',0);
+	foreach my $t (sort {
+			$autovacuum_info{$curdb}{tables}{$b}{vacuums} <=> $autovacuum_info{$curdb}{tables}{$a}{vacuums}
+		} keys %{$autovacuum_info{$curdb}{tables}})
+	{
+		$vacuum_info .= "<tr><td>$t</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{read}) .
+			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{write}) .
+			"</td><td>" . &comma_numbers($autovacuum_info{$curdb}{tables}{$t}{elapsed}) .
+			"</td></tr>";
+		$total_read += $autovacuum_info{$curdb}{tables}{$t}{read};
+		$total_write += $autovacuum_info{$curdb}{tables}{$t}{write};
+		$total_elapsed += $autovacuum_info{$curdb}{tables}{$t}{elapsed};
+		if ($main_elapsed[1] < $autovacuum_info{$curdb}{tables}{$t}{elapsed})
+		{
+			$main_elapsed[0] = $t;
+			$main_elapsed[1] = $autovacuum_info{$curdb}{tables}{$t}{elapsed};
+		}
+		if ($main_write[1] < $autovacuum_info{$curdb}{tables}{$t}{write})
+		{
+			$main_write[0] = $t;
+			$main_write[1] = $autovacuum_info{$curdb}{tables}{$t}{write};
+		}
+		if ($main_read[1] < $autovacuum_info{$curdb}{tables}{$t}{read})
+		{
+			$main_read[0] = $t;
+			$main_read[1] = $autovacuum_info{$curdb}{tables}{$t}{read};
+		}
+	}
+	$vacuum_info .= "<tr><th>Total</th><td>" . &comma_numbers($total_read);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_write);
+	$vacuum_info .= "</td><td>" . &comma_numbers($total_elapsed);
+	$vacuum_info .= "</td></tr>";
+
+	my %infos = ();
+	my @small = ();
+	foreach my $d (sort keys %{$autovacuum_info{$curdb}{tables}})
+	{
+		if ((($autovacuum_info{$curdb}{tables}{$d}{elapsed} * 100) / ($total_elapsed||1)) > $pie_percentage_limit) {
+			$infos{$d} = $autovacuum_info{$curdb}{tables}{$d}{elapsed} || 0;
+		}
+		else
+		{
+			$infos{"Sum CPU elapsed < $pie_percentage_limit%"} += $autovacuum_info{$curdb}{tables}{$d}{elapsed} || 0;
+			push(@small, $d);
+		}
+	}
+	if ($#small == 0)
+	{
+		$infos{$small[0]} = $infos{"Sum CPU elapsed < $pie_percentage_limit%"};
+		delete $infos{"Sum CPU elapsed < $pie_percentage_limit%"};
+	}
+	$drawn_graphs{tablevacuumselapsed_graph} = $NODATA;
+	if ($graph) {
+		$drawn_graphs{tablevacuumselapsed_graph} = &jqplot_piegraph($graphid++, 'graph_tablevacuumselapsed', 'CPU elapsed per tables', %infos);
+	}
+	$vacuum_info = qq{<tr><td colspan="3">$NODATA</td></tr>} if (!$total_elapsed);
+	$total_elapsed = &comma_numbers($total_elapsed);
+	my $database = '';
+	if ($main_elapsed[0] =~ s/^([^\.]+)\.//) {
+		$database = $1;
+	}
+	$main_read[0] =~ s/^([^\.]+)\.//;
+	$main_write[0] =~ s/^([^\.]+)\.//;
+
+	print $fh qq{
+	<div class="analysis-item row" id="vacuums-elapsed-per-table">
+		<h2 class="col-md-12"><i class="glyphicon icon-table"></i> Vacuum throughput per table</h2>
+		<div class="col-md-3">
+			<h3 class="">Key values</h3>
+			<div class="well key-figures">
+				<ul>
+					<li><span class="figure">$main_elapsed[0] ($main_elapsed[1])</span> <span class="figure-label">Max CPU elapsed for vacuum on database $database</span></li>
+					<li><span class="figure">$main_read[0] ($main_read[1] ms)</span> <span class="figure-label">Max I/O read time for vacuum on database $database</span></li>
+					<li><span class="figure">$main_write[0] ($main_write[1] ms)</span> <span class="figure-label">Max I/O write time for vacuum on database $database</span></li>
+				</ul>
+			</div>
+		</div>
+		<div class="col-md-9">
+			<div class="tabbable">
+				<ul class="nav nav-tabs">
+					<li class="active"><a href="#vacuums-elapsed-per-table-graph" data-toggle="tab">Chart</a></li>
+					<li><a href="#vacuums-elapsed-per-table-table" data-toggle="tab">Table</a></li>
+				</ul>
+				<div class="tab-content">
+					<div class="tab-pane active" id="vacuums-elapsed-per-table-graph">
+						$drawn_graphs{tablevacuumselapsed_graph}
+					</div>
+					<div class="tab-pane" id="vacuums-elapsed-per-table-table">
+						<table class="table table-striped table-hover">
+							<thead>
+								<tr><th colspan="1">&nbsp;</th><th colspan="2" style="text-align:center;">I/O timing (ms)</th><th colspan="1" style="text-align:center;">CPU (s)</th>
+								<tr>
+									<th>Table</th>
+									<th>read</th>
+									<th>write</th>
+									<th>elapsed</th>
+								</tr>
+							</thead>
+							<tbody>
+							$vacuum_info
+							</tbody>
+						</table>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div><!-- end of vacuums CPU elapsed per table -->
+};
+	delete $drawn_graphs{tablevacuumselapsed_graph};
+
+}
+
 
 sub print_vacuum_tuple_removed
 {
@@ -11948,6 +12178,7 @@ sub print_lock_queries_report
 				$details .= "<b>Application:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{app}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 				$details .= "<b>Queryid:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 				$details .= "<b>Bind query:</b> yes\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+				$details .= "<b>Log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 				my $explain = '';
 				if ($normalyzed_info{$curdb}{$k}{samples}{$d}{plan}) {
 					$explain = &display_plan("query-a-explain-$rank", $normalyzed_info{$curdb}{$k}{samples}{$d}{plan});
@@ -12122,6 +12353,7 @@ sub print_tempfile_report
 					$details .= "<b>Remote:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{remote}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{remote});
 					$details .= "<b>Application:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{app}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 					$details .= "<b>Queryid:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
+					$details .= "<b>Log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 					if (exists $top_tempfile_info{$curdb} && $#{$top_tempfile_info{$curdb}} >= $i) {
 						$details .= "<b>Info:</b> $top_tempfile_info{$curdb}[$i]->[7]" if ($top_tempfile_info{$curdb}[$i]->[7]);
 					}
@@ -12273,6 +12505,7 @@ sub print_cancelled_report
 					$details .= "Application: $normalyzed_info{$curdb}{$k}{samples}{$d}{app}<br/>" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 					$details .= "Queryid: $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}<br/>" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 					$details .= "Bind query: yes<br/>" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+					$details .= "<b>log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 					print $fh qq{
 						<dt>
 						<div id="query-d-$rank-$idx" class="sql sql-largesize"><i class="glyphicon icon-copy" title="Click to select query"></i>$query</div>$md5
@@ -12722,6 +12955,7 @@ sub print_time_consuming
 			$details .= "<b>Application:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{app}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 			$details .= "<b>Queryid:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 			$details .= "<b>Bind query:</b> yes\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+			$details .= "<b>Log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 			my $explain = '';
 			if ($normalyzed_info{$curdb}{$k}{samples}{$d}{plan}) {
 				$explain = &display_plan("query-e-explain-$rank-$idx", $normalyzed_info{$curdb}{$k}{samples}{$d}{plan});
@@ -12978,6 +13212,7 @@ sub print_most_frequent
 			$details .= "<b>Application:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{app}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 			$details .= "<b>Queryid:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 			$details .= "<b>Bind query:</b> yes\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+			$details .= "<b>Log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 			my $explain = '';
 			if ($normalyzed_info{$curdb}{$k}{samples}{$d}{plan}) {
 				$explain = &display_plan("query-f-explain-$rank-$idx", $normalyzed_info{$curdb}{$k}{samples}{$d}{plan});
@@ -13234,6 +13469,7 @@ sub print_slowest_queries
 			$details .= "<b>Application:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{app}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{app});
 			$details .= "<b>Queryid:</b> $normalyzed_info{$curdb}{$k}{samples}{$d}{queryid}\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{queryid});
 			$details .= "<b>Bind query:</b> yes\n" if ($normalyzed_info{$curdb}{$k}{samples}{$d}{bind});
+			$details .= "<b>Log file:</b> " . $normalyzed_info{$curdb}{$k}{samples}{$d}{logfile} if ($normalyzed_info{$curdb}{$k}{samples}{$d}{logfile});
 			my $explain = '';
 			if ($normalyzed_info{$curdb}{$k}{samples}{$d}{plan}) {
 				$explain = &display_plan("query-g-explain-$rank-$idx", $normalyzed_info{$curdb}{$k}{samples}{$d}{plan});
@@ -14076,44 +14312,6 @@ sub escape_html
 	return $_[0];
 }
 
-sub restore_log_type_count
-{
-	my $curdb = shift;
-
-	# Some messages have seen their log level change during log parsing.
-	# Set the real log level count back
-	foreach my $k (sort {$error_info{$curdb}{$b}{count} <=> $error_info{$curdb}{$a}{count}} keys %{$error_info{$curdb}})
-	{
-		my ($msg, $ret) = &revert_log_level($k);
-		if ($error_info{$curdb}{$k}{count} > 1)
-		{
-			for (my $i = 0 ; $i <= $#{$error_info{$curdb}{$k}{date}} ; $i++) {
-				my ($msg, $ret) = &revert_log_level($error_info{$curdb}{$k}{error}[$i]);
-				if ($msg && ($logs_type{$curdb}{ERROR} > 0)) {
-					$logs_type{$curdb}{ERROR}--;
-					$logs_type{$curdb}{LOG}++;
-				}
-			}
-		}
-		elsif ($error_info{$curdb}{$k}{error}[0])
-		{
-			my ($msg, $ret) = &revert_log_level($error_info{$curdb}{$k}{error}[0]);
-			if ($ret && ($logs_type{$curdb}{ERROR} > 0)) {
-				$logs_type{$curdb}{ERROR}--;
-				$logs_type{$curdb}{LOG}++;
-			}
-		}
-		else
-		{
-			if ($msg && ($logs_type{$curdb}{ERROR} > 0))
-			{
-				$logs_type{$curdb}{ERROR}--;
-				$logs_type{$curdb}{LOG}++;
-			}
-		}
-	}
-}
-
 sub print_log_level
 {
 	my $curdb = shift;
@@ -14134,7 +14332,7 @@ sub print_log_level
 	}
 	my %graph_data = ();
 	my %max_events = ();
-	if ($graph) {
+	if ($graph){
 		my @small = ();
 		foreach my $d (sort keys %{$logs_type{$curdb}}) {
 			if ((($logs_type{$curdb}{$d} * 100) / ($total_logs || 1)) > $pie_percentage_limit) {
@@ -14149,7 +14347,7 @@ sub print_log_level
 			$infos{$small[0]} = $infos{"Sum log types < $pie_percentage_limit%"};
 			delete $infos{"Sum log types < $pie_percentage_limit%"};
 		}
-		foreach my $l (qw(FATAL WARNING ERROR PANIC)) {
+		foreach my $l (qw(FATAL WARNING ERROR PANIC EVENTLOG)) {
 			$max_events{$l} = 0;
 		}
 		my %e_dataavg = ();
@@ -14158,13 +14356,12 @@ sub print_log_level
 				next if (!exists $per_minute_info{$curdb}{$tm}{$h});
 				foreach my $m ("00" .. "59") {
 					next if (!exists $per_minute_info{$curdb}{$tm}{$h}{$m});
-
 					if (exists $per_minute_info{$curdb}{$tm}{$h}{$m}{log_level}) {
 
 						my $rd = &average_per_minutes($m, $avg_minutes);
 
 						# Average per minute
-						foreach my $l (qw(FATAL WARNING ERROR PANIC)) {
+						foreach my $l (qw(FATAL WARNING ERROR PANIC EVENTLOG)) {
 							$e_dataavg{$l}{$tm}{$h}{"$rd"} += ($per_minute_info{$curdb}{$tm}{$h}{$m}{log_level}{$l} || 0);
 							$max_events{$l} += ($per_minute_info{$curdb}{$tm}{$h}{$m}{log_level}{$l} || 0);
 						}
@@ -14201,7 +14398,7 @@ sub print_log_level
 	}
 
 	$drawn_graphs{'eventspersecond_graph'} = &jqplot_linegraph( $graphid++, 'eventspersecond_graph', $graph_data{'PANIC'},
-		$graph_data{FATAL}, $graph_data{'ERROR'}, 'Errors per ' . $avg_minutes . ' minutes',
+		$graph_data{FATAL}, $graph_data{'ERROR'}, 'Events per ' . $avg_minutes . ' minutes',
 		'Errors per ' . $avg_minutes . ' minutes', 'PANIC', 'FATAL', 'ERROR', '', $graph_data{'WARNING'}, 'WARNING'
 	);
 
@@ -14221,7 +14418,8 @@ sub print_log_level
 			<h3 class="">Key values</h3>
 			<div class="well key-figures">
 				<ul>
-					<li><span class="figure">$total_logs</span> <span class="figure-label">Log entries</span></li>
+					<li><span class="figure">$total_logs</span> <span class="figure-label">Event entries</span></li>
+					<li><span class="figure-label">(EVENTLOG entries are formaly LOG level entries that are not queries)</span></li>
 				</ul>
 			</div>
 		</div>
@@ -14255,7 +14453,7 @@ sub print_log_level
 	</div><!-- end of event flow -->
 
 	<div class="analysis-item row" id="minutes-errors-levels">
-		<h2 class="col-md-12"><i class="glyphicon icon-tags"></i> Events distribution</h2>
+		<h2 class="col-md-12"><i class="glyphicon icon-tags"></i> Events distribution (except queries)</h2>
 		<div class="col-md-3">
 			<h3 class="">Key values</h3>
 			<div class="well key-figures">
@@ -14264,6 +14462,7 @@ sub print_log_level
 					<li><span class="figure">$max_events{FATAL}</span> <span class="figure-label">FATAL entries</span></li>
 					<li><span class="figure">$max_events{ERROR}</span> <span class="figure-label">ERROR entries</span></li>
 					<li><span class="figure">$max_events{WARNING}</span> <span class="figure-label">WARNING entries</span></li>
+					<li><span class="figure">$max_events{EVENTLOG}</span> <span class="figure-label">EVENTLOG entries</span></li>
 				</ul>
 			</div>
 		</div>
@@ -14533,7 +14732,8 @@ sub show_error_as_html
 		{
 			last if (($sample > 0) && ($i == $sample));
 			# Escape HTML code in error message
-			my $message = &escape_html($error_info{$curdb}{$k}{error}[$i]);
+			my ($msg, $ret) = &revert_log_level($error_info{$curdb}{$k}{error}[$i]);
+			my $message = &escape_html($msg);
 			my $details = "<b>Date:</b> " . $error_info{$curdb}{$k}{date}[$i] . "\n";
 			my $info    = '';
 			if ($error_info{$curdb}{$k}{detail}[$i]) {
@@ -14556,6 +14756,9 @@ sub show_error_as_html
 				$details .= "<b>User:</b> $error_info{$curdb}{$k}{user}[$i]\n";
 				$details .= "<b>Remote:</b> $error_info{$curdb}{$k}{remote}[$i]\n";
 				$details .= "<b>Code:</b> $error_info{$curdb}{$k}{sqlstate}[$i]\n" if ($error_info{$curdb}{$k}{sqlstate}[$i]);
+			}
+			if ($error_info{$curdb}{$k}{logfile}[$i]) {
+				$details .= "<b>Log file:</b> $error_info{$curdb}{$k}{logfile}[$i]\n";
 			}
 			$details =~ s/<br\/>$//s;
 			if ($wide_char)
@@ -15078,7 +15281,7 @@ sub load_stats
 	$pgb_overall_stat{histogram}{session_total} += $_pgb_overall_stat{histogram}{session_total};
 
 	### Logs level ###
-	foreach my $l (qw(LOG WARNING ERROR FATAL PANIC DETAIL HINT STATEMENT CONTEXT))
+	foreach my $l (qw(LOG WARNING ERROR FATAL PANIC DETAIL HINT STATEMENT CONTEXT EVENTLOG))
 	{
 		foreach my $curdb (keys %_logs_type)
 		{
@@ -15244,7 +15447,8 @@ sub load_stats
 										$_error_info{$curdb}{$q}{app}[$i],
 										$_error_info{$curdb}{$q}{remote}[$i],
 										$_error_info{$curdb}{$q}{sqlstate}[$i],
-										$_error_info{$curdb}{$q}{queryid}[$i]
+										$_error_info{$curdb}{$q}{queryid}[$i],
+										$_error_info{$curdb}{$q}{logfile}[$i]
 										);
 			}
 		}
@@ -15705,6 +15909,12 @@ sub load_stats
 			$autovacuum_info{$curdb}{tables}{$table}{wal_record} += $_autovacuum_info{$curdb}{tables}{$table}{wal_record};
 			$autovacuum_info{$curdb}{tables}{$table}{wal_full_page} += $_autovacuum_info{$curdb}{tables}{$table}{wal_full_page};
 			$autovacuum_info{$curdb}{tables}{$table}{wal_bytes} += $_autovacuum_info{$curdb}{tables}{$table}{wal_bytes};
+			$autovacuum_info{$curdb}{tables}{$table}{pages}{frozen} += $_autovacuum_info{$curdb}{tables}{$table}{pages}{frozen};
+			$autovacuum_info{$curdb}{tables}{$table}{tuples}{frozen} += $_autovacuum_info{$curdb}{tables}{$table}{tuples}{frozen};
+			$autovacuum_info{$curdb}{tables}{$table}{read} += $_autovacuum_info{$curdb}{tables}{$table}{read};
+			$autovacuum_info{$curdb}{tables}{$table}{write} += $_autovacuum_info{$curdb}{tables}{$table}{write};
+			$autovacuum_info{$curdb}{tables}{$table}{elapsed} += $_autovacuum_info{$curdb}{tables}{$table}{elapsed};
+
 		}
 		if ($_autovacuum_info{$curdb}{peak}{system_usage}{elapsed} > $autovacuum_info{$curdb}{peak}{system_usage}{elapsed})
 		{
@@ -15987,6 +16197,7 @@ sub dump_error_as_json
 {
 	my $perl_hash = { 'error_info' => \%error_info };
 
+
 	my $json = undef;
 	if (!$json_prettify) {
 		$json = encode_json($perl_hash) || localdie ("Encode events objects to JSON failed!\n");
@@ -15995,11 +16206,14 @@ sub dump_error_as_json
 		$json = $coder->encode($perl_hash) || localdie ("Encode events objects to prettified JSON failed!\n");
 	}
 
+	revert_log_level_by_reference(\$json);
+
 	print $fh $json;
 }
 
 sub dump_as_json
 {
+
 	my $perl_hash = {
 		'overall_stat' => \%overall_stat,
 		'pgb_overall_stat' => \%pgb_overall_stat,
@@ -16037,6 +16251,8 @@ sub dump_as_json
 		my $coder = JSON::XS->new->ascii->pretty->allow_nonref(0);
 		$json = $coder->encode($perl_hash) || localdie ("Encode stats objects to prettified JSON failed!\n");
 	}
+
+	revert_log_level_by_reference(\$json);
 
 	print $fh $json;
 }
@@ -16353,7 +16569,7 @@ sub is_excluded_query
 
 	foreach (@exclude_query)
 	{
-		if ($query =~ /$_/i)
+		if ($query =~ /$_/iis)
 		{
 			$query = '';
 			return 1;
@@ -16368,7 +16584,7 @@ sub is_included_query
 	my $query = shift;
 	foreach (@include_query)
 	{
-		if ($query =~ /$_/i)
+		if ($query =~ /$_/is)
 		{
 			$query = '';
 			return 1;
@@ -16410,9 +16626,13 @@ sub parse_query
 	####
 	if ($prefix_vars{'t_loglevel'} eq 'LOG')
 	{
-		if (&change_log_level($prefix_vars{'t_query'})) {
+		if (&change_log_level($prefix_vars{'t_query'}))
+		{
+			$prefix_vars{'t_origloglevel'} = 'EVENTLOG';
 			$prefix_vars{'t_loglevel'} = 'ERROR';
-		} else {
+		}
+		else
+		{
 			$is_log_level = 1;
 		}
 	}
@@ -16465,7 +16685,11 @@ sub parse_query
 	}
 
 	# Store a counter of logs type
-	$logs_type{$curdb}{$prefix_vars{'t_loglevel'}}++;
+	if (!exists $prefix_vars{'t_origloglevel'}) {
+		$logs_type{$curdb}{$prefix_vars{'t_loglevel'}}++;
+	} else {
+		$logs_type{$curdb}{$prefix_vars{'t_origloglevel'}}++;
+	}
 
 	# Do not parse lines that are not an error message when error only report is requested
 	if ($error_only && ($prefix_vars{'t_loglevel'} !~ $full_error_regex)) {
@@ -16506,14 +16730,14 @@ sub parse_query
 	if (exists $cur_info{$t_pid} && ($prefix_vars{'t_loglevel'} =~ /(DETAIL|STATEMENT|CONTEXT|HINT)/)
 		&& ($cur_info{$t_pid}{loglevel} =~ $main_error_regex))
 	{
-		if (($prefix_vars{'t_loglevel'} ne 'DETAIL') || ($prefix_vars{'t_query'} !~ /parameters: (.*)/)) {
+		if (($prefix_vars{'t_loglevel'} ne 'DETAIL') || ($prefix_vars{'t_query'} !~ /[Pp]arameters: (.*)/)) {
 			# Store error details only if this is not a parameter list (never present with errors)
 			$cur_info{$t_pid}{"\L$prefix_vars{'t_loglevel'}\E"} .= $prefix_vars{'t_query'};
 		}
 		if (($prefix_vars{'t_loglevel'} eq 'STATEMENT') && exists $cur_temp_info{$t_pid} && ($cur_temp_info{$t_pid}{query} eq '')) {
 			$cur_temp_info{$t_pid}{query} = $prefix_vars{'t_query'};
 		}
-		return;
+		#return;
 	}
 
 	# Special cases when a STATEMENT is parsed
@@ -16537,6 +16761,7 @@ sub parse_query
 			$cur_lock_info{$t_pid}{dbclient}  = $prefix_vars{'t_client'} || $prefix_vars{'t_dbclient'};
 			$cur_lock_info{$t_pid}{dbappname} = $prefix_vars{'t_appname'};
 			$cur_lock_info{$t_pid}{queryid}   = $prefix_vars{'t_queryid'};
+			$cur_lock_info{$t_pid}{logfile}   = $current_log_file if ($current_log_file);
 			$cur_lock_info{$t_pid}{cur_db}    = $curdb;
 			return;
 		}
@@ -16552,6 +16777,7 @@ sub parse_query
 			$cur_cancel_info{$t_pid}{dbappname} = $prefix_vars{'t_appname'};
 			$cur_cancel_info{$t_pid}{queryid}   = $prefix_vars{'t_queryid'};
 			$cur_cancel_info{$t_pid}{cur_db}    = $curdb;
+			$cur_cancel_info{$t_pid}{logfile}   = $current_log_file if ($current_log_file);
 			return;
 		}
 
@@ -16587,6 +16813,7 @@ sub parse_query
 			$cur_lock_info{$t_pid}{dbclient}  = $prefix_vars{'t_client'} || $prefix_vars{'t_dbclient'};
 			$cur_lock_info{$t_pid}{dbappname} = $prefix_vars{'t_appname'};
 			$cur_lock_info{$t_pid}{queryid}   = $prefix_vars{'t_queryid'};
+			$cur_lock_info{$t_pid}{logfile}   = $current_log_file if ($current_log_file);
 			$cur_lock_info{$t_pid}{cur_db}    = $curdb;
 		}
 		return;
@@ -16757,16 +16984,33 @@ sub parse_query
 
 		if ($fmt eq 'csv' || $fmt eq 'jsonlog')
 		{
-			if ($prefix_vars{'t_query'} =~ /(pages|tuples): (\d+) removed, (\d+) remain/)
+			if ($prefix_vars{'t_query'} =~ /(pages): (\d+) removed, (\d+) remain/)
 			{
-					$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{removed} += $2;
-					$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{remain} += $3;
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{removed} += $2;
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{remain} += $3;
+			}
+			if ($prefix_vars{'t_query'} =~ /(tuples): (\d+) removed, (\d+) remain/)
+			{
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{removed} += $2;
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{$1}{remain} += $3;
+			}
+			if ($prefix_vars{'t_query'} =~ /timings: read: ([\d\.]+) ms, write: ([\d\.]+) ms/)
+			{
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{read} += $1;
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{write} += $2;
+			}
+			if ($prefix_vars{'t_query'} =~ /frozen: (\d+) pages from table .* had (\d+) tuples frozen/)
+			{
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{pages}{frozen} += $1;
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{tuples}{frozen} += $2;
 			}
 			if ($prefix_vars{'t_query'} =~ /(\d+) are dead but not yet removable/) {
 				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{tuples}{notremovable} += $1;
 			}
-			if ($prefix_vars{'t_query'} =~ m#system usage: CPU .* (?:sec|s,) elapsed (.*) s#)
+			if ($prefix_vars{'t_query'} =~ /system usage: CPU: user: (.*) (?:sec|s,) system: (.*) (?:sec|s,) elapsed: ([^\s]+)/)
 			{
+				$autovacuum_info{$curdb}{tables}{$cur_info{$t_pid}{vacuum}}{elapsed} += $3;
+				$per_minute_info{$curdb}{$date_part}{$prefix_vars{'t_hour'}}{$prefix_vars{'t_min'}}{autovacuum}{second}{$prefix_vars{'t_sec'}{second}} += $3;
 				if ($3 > $autovacuum_info{$curdb}{peak}{system_usage}{elapsed})
 				{
 					$autovacuum_info{$curdb}{peak}{system_usage}{elapsed} = $3;
@@ -16978,7 +17222,7 @@ sub parse_query
 		if ($cur_info{$t_pid}{loglevel} eq 'LOG' && $prefix_vars{'t_loglevel'} eq 'DETAIL')
 		{
 			# Apply bind parameters if any
-			if ($prefix_vars{'t_query'} =~ /parameters: (.*)/)
+			if ($prefix_vars{'t_query'} =~ /[Pp]arameters: (.*)/)
 			{
 				$cur_bind_info{$t_pid}{'bind'}{'parameters'} = $1 if (exists $cur_bind_info{$t_pid});
 				$cur_info{$t_pid}{parameters} = "$1";
@@ -17007,7 +17251,7 @@ sub parse_query
 	}
 
 	# Apply bind parameters if any
-	if ($prefix_vars{'t_detail'} =~ /parameters: (.*)/)
+	if ($prefix_vars{'t_detail'} =~ /[Pp]arameters: (.*)/)
 	{
 		$cur_bind_info{$t_pid}{'bind'}{'parameters'} = $1 if (exists $cur_bind_info{$t_pid});
 		$cur_info{$t_pid}{parameters} = "$1";
@@ -17367,9 +17611,10 @@ sub set_current_infos
 	$cur_info{$t_pid}{year}      = $prefix_vars{'t_year'} if (!$cur_info{$t_pid}{year});
 	$cur_info{$t_pid}{month}     = $prefix_vars{'t_month'} if (!$cur_info{$t_pid}{month});
 	$cur_info{$t_pid}{day}       = $prefix_vars{'t_day'} if (!$cur_info{$t_pid}{day});
-	$cur_info{$t_pid}{hour}      = $prefix_vars{'t_hour'} if (!exists $cur_info{$t_pid}{sec} || ($cur_info{$t_pid}{hour} eq ''));
-	$cur_info{$t_pid}{min}       = $prefix_vars{'t_min'} if (!exists $cur_info{$t_pid}{sec} || ($cur_info{$t_pid}{min} eq ''));
+	$cur_info{$t_pid}{hour}      = $prefix_vars{'t_hour'} if (!exists $cur_info{$t_pid}{hour} || ($cur_info{$t_pid}{hour} eq ''));
+	$cur_info{$t_pid}{min}       = $prefix_vars{'t_min'} if (!exists $cur_info{$t_pid}{min} || ($cur_info{$t_pid}{min} eq ''));
 	$cur_info{$t_pid}{sec}       = $prefix_vars{'t_sec'} if (!exists $cur_info{$t_pid}{sec} || ($cur_info{$t_pid}{sec} eq ''));
+	$cur_info{$t_pid}{ms}        = $prefix_vars{'t_ms'} if (!exists $cur_info{$t_pid}{ms} || ($cur_info{$t_pid}{ms} eq ''));
 	$cur_info{$t_pid}{timestamp} = $prefix_vars{'t_timestamp'} if (!$cur_info{$t_pid}{timestamp});
 	$cur_info{$t_pid}{ident}     = $prefix_vars{'t_ident'} if (!$cur_info{$t_pid}{ident});
 	$cur_info{$t_pid}{query}     = $prefix_vars{'t_query'} if (!$cur_info{$t_pid}{query});
@@ -17378,6 +17623,7 @@ sub set_current_infos
 	$cur_info{$t_pid}{pid}       = $prefix_vars{'t_pid'} if (!$cur_info{$t_pid}{pid});
 	$cur_info{$t_pid}{session}   = $prefix_vars{'t_session_line'} if (!$cur_info{$t_pid}{session});
 	$cur_info{$t_pid}{loglevel}  = $prefix_vars{'t_loglevel'} if (!$cur_info{$t_pid}{loglevel});
+	$cur_info{$t_pid}{origloglevel}= $prefix_vars{'t_origloglevel'} if (exists $prefix_vars{'t_origloglevel'});
 	$cur_info{$t_pid}{dbname}    = $prefix_vars{'t_dbname'} if (!$cur_info{$t_pid}{dbname});
 	$cur_info{$t_pid}{dbuser}    = $prefix_vars{'t_dbuser'} if (!$cur_info{$t_pid}{dbuser});
 	$cur_info{$t_pid}{dbclient}  = $prefix_vars{'t_client'} || $prefix_vars{'t_dbclient'} if (!$cur_info{$t_pid}{dbclient});
@@ -17385,6 +17631,7 @@ sub set_current_infos
 	$cur_info{$t_pid}{bind}      = $prefix_vars{'t_bind'} if (!$cur_info{$t_pid}{bind});
 	$cur_info{$t_pid}{sqlstate}  = $prefix_vars{'t_sqlstate'} if (!$cur_info{$t_pid}{sqlstate});
 	$cur_info{$t_pid}{backendtype}  = $prefix_vars{'t_backend_type'} if (!$cur_info{$t_pid}{backendtype});
+	$cur_info{$t_pid}{logfile}   = $current_log_file if ($current_log_file);
 	# Store current report name and list of database
 	$cur_info{$t_pid}{cur_db} = set_current_db($cur_info{$t_pid}{dbname});
 }
@@ -17428,7 +17675,7 @@ sub store_queries
 			my @t_res = split(/[\s]*,[\s]*/, $cur_info{$t_pid}{parameters});
 			$cur_info{$t_pid}{query} =~ s/\$(\d+)/$t_res[$1-1]/gs;
 		}
-		return if ($cur_info{$t_pid}{query} =~ /^parameters:/);
+		return if ($cur_info{$t_pid}{query} =~ /^[Pp]arameters:/);
 		print $fh "# Query #", $query_numbering++, "\n" if ($query_numbering);
 		$cur_info{$t_pid}{query} .= ';' if ($cur_info{$t_pid}{query} !~ /;\s*$/s);
 		print $fh "$cur_info{$t_pid}{query}\n";
@@ -17522,10 +17769,15 @@ sub store_queries
 		$error_info{$cur_info{$t_pid}{cur_db}}{$normalized_error}{chronos}{"$cur_day_str"}{"$cur_hour_str"}{min}{$cur_info{$t_pid}{min}}++;
 
 		# Stores log level count per minute
-		$per_minute_info{$cur_info{$t_pid}{cur_db}}{"$cur_day_str"}{"$cur_hour_str"}{$cur_info{$t_pid}{min}}{log_level}{$cur_info{$t_pid}{loglevel}}++;
+		if (!exists $cur_info{$t_pid}{origloglevel}) {
+			$per_minute_info{$cur_info{$t_pid}{cur_db}}{"$cur_day_str"}{"$cur_hour_str"}{$cur_info{$t_pid}{min}}{log_level}{$cur_info{$t_pid}{loglevel}}++;
+		} else {
+			$per_minute_info{$cur_info{$t_pid}{cur_db}}{"$cur_day_str"}{"$cur_hour_str"}{$cur_info{$t_pid}{min}}{log_level}{$cur_info{$t_pid}{origloglevel}}++;
+		}
 
 		# Stores normalized query samples
-		if ($sample > 0) {
+		if ($sample > 0)
+		{
 			my $cur_last_log_timestamp = "$cur_info{$t_pid}{year}-$cur_info{$t_pid}{month}-$cur_info{$t_pid}{day} " .
 							"$cur_info{$t_pid}{hour}:$cur_info{$t_pid}{min}:$cur_info{$t_pid}{sec}";
 			&set_top_error_sample( $cur_info{$t_pid}{cur_db},	$normalized_error,
@@ -17541,20 +17793,27 @@ sub store_queries
 									$cur_info{$t_pid}{dbclient},
 									$cur_info{$t_pid}{sqlstate},
 									$cur_info{$t_pid}{queryid},
+									$cur_info{$t_pid}{logfile}
 			);
 		}
 
 	}
 	elsif ($cur_info{$t_pid}{loglevel} eq 'LOG')
 	{
+		# Special case for auto_explain plan with csv and json logs
+		if ((!exists $cur_plan_info{$t_pid}{plan} || $cur_plan_info{$t_pid}{plan} eq '') && $cur_info{$t_pid}{query} =~ s/^Query Text: ([^;]+);(.*)/$1/s)
+		{
+			$cur_plan_info{$t_pid}{plan} = $2;
+		}
 
 		# Store auto explain plan when switching to another log entry
 		if (exists $cur_plan_info{$t_pid}{plan})
 		{
 			$cur_plan_info{$t_pid}{plan} =~ s/^\s+//s;
 			$cur_plan_info{$t_pid}{plan} =~ s/\s+$//s;
-			# Extract the query part from the plan then the plan itself
-			if ($cur_plan_info{$t_pid}{plan}) {
+			# Extract the query part from the plan, then the plan itself
+			if ($cur_plan_info{$t_pid}{plan})
+			{
 				my $key = 'query';
 				my @plan = split("\n", $cur_plan_info{$t_pid}{plan});
 				foreach my $l (@plan) {
@@ -17780,7 +18039,8 @@ sub store_queries
 										$cur_info{$t_pid}{dbappname},
 										$cur_info{$t_pid}{bind},
 										$cur_info{$t_pid}{plan},
-										$cur_info{$t_pid}{queryid}
+										$cur_info{$t_pid}{queryid},
+										$cur_info{$t_pid}{logfile}
 									);
 			}
 		}
@@ -17984,7 +18244,8 @@ sub store_temporary_and_lock_infos
 									$cur_temp_info{$t_pid}{dbappname},
 									$cur_temp_info{$t_pid}{bind},
 									$cur_temp_info{$t_pid}{plan},
-									$cur_temp_info{$t_pid}{queryid});
+									$cur_temp_info{$t_pid}{queryid},
+									$cur_temp_info{$t_pid}{logfile});
 		}
 		delete $cur_temp_info{$t_pid};
 	}
@@ -18034,7 +18295,8 @@ sub store_temporary_and_lock_infos
 									$cur_lock_info{$t_pid}{dbappname},
 									$cur_lock_info{$t_pid}{bind},
 									$cur_lock_info{$t_pid}{plan},
-									$cur_lock_info{$t_pid}{queryid});
+									$cur_lock_info{$t_pid}{queryid},
+									$cur_lock_info{$t_pid}{logfile});
 		}
 		delete $cur_lock_info{$t_pid};
 	}
@@ -18656,7 +18918,7 @@ sub build_log_line_prefix_regex
 		'%Q' => [('t_queryid',	  '([\-]*\d+)')],	# Query ID
 		'%n' => [('t_epoch',    '(\d{10}\.\d{3})')],    # timestamp as Unix epoch
 		'%t' => [('t_timestamp',    '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[Z]*(?:[ \+\-][A-Z\+\-\d]{3,6})?')],      # timestamp without milliseconds
-		'%m' => [('t_mtimestamp',   '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})\.\d+(?:[ \+\-][A-Z\+\-\d]{3,6})?')], # timestamp with milliseconds
+		'%m' => [('t_mtimestamp',   '(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}\.\d+)(?:[ \+\-][A-Z\+\-\d]{3,6})?')], # timestamp with milliseconds
 		'%l' => [('t_session_line', '(\d+)')],							# session line number
 		'%s' => [('t_session_timestamp', '(\d{4}-\d{2}-\d{2}[\sT]\d{2}):\d{2}:\d{2}(?:[ \+\-][A-Z\+\-\d]{3,6})?')],    # session start timestamp
 		'%c' => [('t_session_id',	'([0-9a-f\.]*)')],					       # session ID
@@ -18772,13 +19034,22 @@ sub get_file_size
 			}
 			$ssh .= " -i $ssh_identity" if ($ssh_identity);
 			$ssh .= " $ssh_options" if ($ssh_options);
-			&logmsg('DEBUG', "Looking for file size using command: $ssh $host_info \"ls -l '$file'\" | awk '{print \$5}'");
-			$totalsize = `$ssh $host_info "ls -l '$file'" | awk '{print \$5}'`;
+
+			my $ssh_command_ls = "\"";
+			$ssh_command_ls .= "sudo " if ($ssh_sudo);
+			$ssh_command_ls .= "ls -l '$file'\" | awk '{print \$5}'";
+
+			&logmsg('DEBUG', "Looking for file size using command: $ssh $host_info $ssh_command_ls");
+			$totalsize = `$ssh $host_info $ssh_command_ls`;
 			chomp($totalsize);
 			localdie("FATAL: can't get size of remote file, please check what's going wrong with command: $ssh $host_info \"ls -l '$file'\"\n") if ($totalsize eq '');
 		} elsif ($remote_host) {
-			&logmsg('DEBUG', "Looking for file size using command: $remote_command \"ls -l '$logf'\" | awk '{print \$5}'");
-			$totalsize = `$remote_command "ls -l '$logf'" | awk '{print \$5}'`;
+			my $ssh_command_ls = "\"";
+			$ssh_command_ls .= "sudo " if ($ssh_sudo);
+			$ssh_command_ls .= "ls -l '$logf'\" | awk '{print \$5}'";
+
+			&logmsg('DEBUG', "Looking for file size using command: $remote_command $ssh_command_ls");
+			$totalsize = `$remote_command $ssh_command_ls`;
 			chomp($totalsize);
 			localdie("FATAL: can't get size of remote file, please check what's going wrong with command: $ssh_command \"ls -l '$logf'\"\n") if ($totalsize eq '');
 		}
@@ -19002,9 +19273,14 @@ sub get_log_file
 						my $ssh = $ssh_command || 'ssh';
 						$ssh .= " -i $ssh_identity" if ($ssh_identity);
 						$ssh .= " $ssh_options" if ($ssh_options);
-						&logmsg('DEBUG', "Retrieving log entries using command: $ssh $host_info \"cat '$file'\" |");
+
+						my $ssh_command_cat = "\"";
+						$ssh_command_cat .= "sudo " if ($ssh_sudo);
+						$ssh_command_cat .= "cat '$file'\"";
+
+						&logmsg('DEBUG', "Retrieving log entries using command: $ssh $host_info $ssh_command_cat |");
 						# Open a pipe to cat program
-						open($lfile, '-|', "$ssh $host_info \"cat '$file'\"") || localdie("FATAL: cannot read from pipe to $ssh $host_info \"cat '$file'\". $!\n");
+						open($lfile, '-|', "$ssh $host_info $ssh_command_cat") || localdie("FATAL: cannot read from pipe to $ssh $host_info $ssh_command_cat. $!\n");
 					}
 					else
 					{
@@ -19032,9 +19308,14 @@ sub get_log_file
 					}
 					$ssh .= " -i $ssh_identity" if ($ssh_identity);
 					$ssh .= " $ssh_options" if ($ssh_options);
-					&logmsg('DEBUG', "Retrieving log sample using command: $ssh $host_info \"tail -n 100 '$file'\" |");
+
+					my $ssh_command_tail = "\"";
+					$ssh_command_tail .= "sudo " if ($ssh_sudo);
+					$ssh_command_tail .= "tail -n 100 '$file'\"";
+
+					&logmsg('DEBUG', "Retrieving log sample using command: $ssh $host_info $ssh_command_tail |");
 					# Open a pipe to cat program
-					open($lfile, '-|', "$ssh $host_info \"tail -n 100 '$file'\"") || localdie("FATAL: cannot read from pipe to $remote_command \"tail -n 100 '$logf'\". $!\n");
+					open($lfile, '-|', "$ssh $host_info $ssh_command_tail") || localdie("FATAL: cannot read from pipe to $remote_command $ssh_command_tail. $!\n");
 				}
 				else
 				{
@@ -19663,6 +19944,11 @@ sub dump_raw_csv
 
 	my $t_pid = shift;
 
+	my $sep = ';';
+	if ($csv_sep_char) {
+		$sep = $csv_sep_char;
+	}
+
 	# CSV columns information:
 	# ------------------------
 	# timestamp without milliseconds
@@ -19679,23 +19965,23 @@ sub dump_raw_csv
 	# application name
 	# backend type
 	# query id
-	
-	print "timestamp;username;dbname;pid;client;sessionid;loglevel;sqlstate;duration;query/error;parameters;appname;backendtype;queryid\n" if (!$header_done);
+
+	print "timestamp${sep}username${sep}dbname${sep}pid${sep}client${sep}sessionid${sep}loglevel${sep}sqlstate${sep}duration${sep}query/error${sep}parameters${sep}appname${sep}backendtype${sep}queryid\n" if (!$header_done);
 	$header_done = 1;
-	print "$cur_info{$t_pid}{timestamp};$cur_info{$t_pid}{dbuser};$cur_info{$t_pid}{dbname};";
-	print "$cur_info{$t_pid}{pid};$cur_info{$t_pid}{dbclient};$cur_info{$t_pid}{session};";
-	print "$cur_info{$t_pid}{loglevel};$cur_info{$t_pid}{sqlstate};$cur_info{$t_pid}{duration};";
+	print "$cur_info{$t_pid}{timestamp}$cur_info{$t_pid}{ms}${sep}$cur_info{$t_pid}{dbuser}${sep}$cur_info{$t_pid}{dbname}${sep}";
+	print "$cur_info{$t_pid}{pid}${sep}$cur_info{$t_pid}{dbclient}${sep}$cur_info{$t_pid}{session}${sep}";
+	print "$cur_info{$t_pid}{loglevel}${sep}$cur_info{$t_pid}{sqlstate}${sep}$cur_info{$t_pid}{duration}${sep}";
 	my $query = ($cur_info{$t_pid}{query} || $cur_lock_info{$t_pid}{query} || $cur_temp_info{$t_pid}{query}
 	        || $cur_cancel_info{$t_pid}{query} || "plan:\n" .$cur_plan_info{$t_pid}{plan});
 	$query =~ s/[\r\n]/\\n/gs;
-	if ($query =~ /;/) {
+	if ($query =~ /${sep}/) {
 		$query =~ s/"/""/g;
 		$query = '"' . $query . '"';
 	}
-	print $query . ";";
-	($cur_info{$t_pid}{parameters}) ? print "\"$cur_info{$t_pid}{parameters}\";" : print ';';
-	($cur_info{$t_pid}{dbappname}) ? print "\"$cur_info{$t_pid}{dbappname}\";" : print ';';
-	print "$cur_info{$t_pid}{backendtype};$cur_info{$t_pid}{queryid}\n";
+	print $query . "${sep}";
+	($cur_info{$t_pid}{parameters}) ? print "\"$cur_info{$t_pid}{parameters}\"${sep}" : print "${sep}";
+	($cur_info{$t_pid}{dbappname}) ? print "\"$cur_info{$t_pid}{dbappname}\"${sep}" : print "${sep}";
+	print "$cur_info{$t_pid}{backendtype}${sep}$cur_info{$t_pid}{queryid}\n";
 }
 
 
@@ -20203,7 +20489,7 @@ sub highlight_code
     # lowercase/uppercase known functions or words followed by an open parenthesis
     # if the token is not a keyword, an open parenthesis or a comment
     if (($self->_is_function( $token, $last_token, $next_token ) && $next_token eq '(')
-	    || (!$self->_is_keyword( $token, $next_token, $last_token ) && !$next_token eq '('
+	    || (!$self->_is_keyword( $token, $next_token, $last_token ) && $next_token ne '('
 		    && $token ne '(' && !$self->_is_comment( $token )) ) {
         if ($self->{ 'uc_functions' } == 1) {
             $token = '<span class="kw2_l">' . $token . '</span>';
@@ -21007,7 +21293,6 @@ sub beautify
 
 	if ($token =~ /^(BEGIN|DECLARE)$/i)
 	{
-		#	print STDERR "JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ $token\n" if (uc($token) eq 'DECLARE');
             $self->{ '_is_in_create' }-- if ($self->{ '_is_in_create' });
 	    if (uc($token) eq 'BEGIN')
 	    {
@@ -21648,7 +21933,7 @@ sub beautify
 	    $add_newline = 0 if ($self->{ '_is_in_value' } and $self->{ '_parenthesis_level_value' });
 	    $add_newline = 0 if ($self->{ '_is_in_function' } or $self->{ '_is_in_statistics' });
 	    $add_newline = 0 if (defined $self->_next_token and !$self->{ 'no_comments' } and $self->_is_comment($self->_next_token));
-	    $add_newline = 0 if (defined $self->_next_token and $self->_next_token =~ /KEYWCONST/ and $self->{ '_tokens' }[1] =~ /^(LANGUAGE|STRICT)$/i);
+	    $add_newline = 0 if (defined $self->_next_token and $self->_next_token =~ /KEYWCONST/ and $#{ $self->{ '_tokens' } } >= 1 and $self->{ '_tokens' }[1] =~ /^(LANGUAGE|STRICT)$/i);
 	    $add_newline = 1 if ($self->{ '_is_in_truncate' });
 	    $self->_new_line($token,$last) if ($add_newline and $self->{ 'comma' } eq 'end' and ($self->{ 'comma_break' } || $self->{ '_current_sql_stmt' } ne 'INSERT'));
         }
@@ -22804,7 +23089,7 @@ sub _add_token
         # if the token is not a keyword, an open parenthesis or a comment
         my $fct = $self->_is_function( $token, $last_token, $next_token ) || '';
         if (($fct and $next_token eq '(' and defined $last_token and uc($last_token) ne 'CREATE')
-		or (!$self->_is_keyword( $token, $next_token, $last_token ) and !$next_token eq '('
+		or (!$self->_is_keyword( $token, $next_token, $last_token ) and $next_token ne '('
 				    and $token ne '(' and !$self->_is_comment( $token )) )
 	{
             $token =~ s/$fct/\L$fct\E/i if ( $self->{ 'uc_functions' } == 1 );
